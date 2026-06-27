@@ -1,0 +1,411 @@
+{
+  "id": "deep-research-lite",
+  "name": "Deep Research Lite",
+  "description": "Token-lean multi-source research with adaptive depth, claim deduplication, selective adversarial verification, and a consistent report shape.",
+  "sources_per_angle": 3,
+  "escalate_total_votes": 3,
+  "refutes_to_kill": 2,
+  "projected_escalation_rate": 0.25,
+  "token_estimates": {
+    "scope": {
+      "input": 1500,
+      "output": 700
+    },
+    "search": {
+      "input": 1400,
+      "output": 700
+    },
+    "fetch": {
+      "input": 9500,
+      "output": 1200
+    },
+    "dedup": {
+      "input": 9000,
+      "output": 2500
+    },
+    "verify": {
+      "input": 2200,
+      "output": 700
+    },
+    "synthesize": {
+      "input": 9000,
+      "output": 2500
+    },
+    "critic": {
+      "input": 2500,
+      "output": 800
+    }
+  },
+  "phases": [
+    {
+      "title": "Scope",
+      "detail": "Decompose the question and pick a depth tier."
+    },
+    {
+      "title": "Search",
+      "detail": "Search complementary angles."
+    },
+    {
+      "title": "Fetch",
+      "detail": "Fetch top URLs and extract falsifiable claims."
+    },
+    {
+      "title": "Dedup",
+      "detail": "Merge semantically duplicate claims."
+    },
+    {
+      "title": "Verify",
+      "detail": "Use skeptical claim verification with selective escalation."
+    },
+    {
+      "title": "Synthesize",
+      "detail": "Write a sourced report from verified claims."
+    },
+    {
+      "title": "Gap check",
+      "detail": "Check whether the findings answer the original question."
+    }
+  ],
+  "tiers": {
+    "shallow": {
+      "angles": 3,
+      "fetch": 6,
+      "claims": 8
+    },
+    "standard": {
+      "angles": 4,
+      "fetch": 10,
+      "claims": 12
+    },
+    "deep": {
+      "angles": 5,
+      "fetch": 15,
+      "claims": 18
+    }
+  },
+  "schemas": {
+    "scope": {
+      "type": "object",
+      "required": [
+        "question",
+        "depth",
+        "angles",
+        "summary"
+      ],
+      "properties": {
+        "question": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "depth": {
+          "enum": [
+            "shallow",
+            "standard",
+            "deep"
+          ]
+        },
+        "angles": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "query"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "query": {
+                "type": "string"
+              },
+              "rationale": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "search": {
+      "type": "object",
+      "required": [
+        "results"
+      ],
+      "properties": {
+        "results": {
+          "type": "array",
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "required": [
+              "url",
+              "title",
+              "relevance"
+            ],
+            "properties": {
+              "url": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "snippet": {
+                "type": "string"
+              },
+              "relevance": {
+                "enum": [
+                  "high",
+                  "medium",
+                  "low"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "extract": {
+      "type": "object",
+      "required": [
+        "claims",
+        "sourceQuality"
+      ],
+      "properties": {
+        "sourceQuality": {
+          "enum": [
+            "primary",
+            "secondary",
+            "blog",
+            "forum",
+            "unreliable"
+          ]
+        },
+        "publishDate": {
+          "type": "string"
+        },
+        "claims": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "required": [
+              "claim",
+              "quote",
+              "importance"
+            ],
+            "properties": {
+              "claim": {
+                "type": "string"
+              },
+              "quote": {
+                "type": "string"
+              },
+              "importance": {
+                "enum": [
+                  "central",
+                  "supporting",
+                  "tangential"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "dedup": {
+      "type": "object",
+      "required": [
+        "claims"
+      ],
+      "properties": {
+        "claims": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "object",
+            "required": [
+              "claim",
+              "quote",
+              "importance",
+              "sourceQuality",
+              "sourceUrls"
+            ],
+            "properties": {
+              "claim": {
+                "type": "string"
+              },
+              "quote": {
+                "type": "string"
+              },
+              "importance": {
+                "enum": [
+                  "central",
+                  "supporting",
+                  "tangential"
+                ]
+              },
+              "sourceQuality": {
+                "enum": [
+                  "primary",
+                  "secondary",
+                  "blog",
+                  "forum",
+                  "unreliable"
+                ]
+              },
+              "sourceUrls": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "verdict": {
+      "type": "object",
+      "required": [
+        "refuted",
+        "evidence",
+        "confidence"
+      ],
+      "properties": {
+        "refuted": {
+          "type": "boolean"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "searched": {
+          "type": "boolean"
+        },
+        "counterSource": {
+          "type": "string"
+        }
+      }
+    },
+    "report": {
+      "type": "object",
+      "required": [
+        "summary",
+        "findings",
+        "caveats"
+      ],
+      "properties": {
+        "summary": {
+          "type": "string"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "claim",
+              "confidence",
+              "sources",
+              "evidence"
+            ],
+            "properties": {
+              "claim": {
+                "type": "string"
+              },
+              "confidence": {
+                "enum": [
+                  "high",
+                  "medium",
+                  "low"
+                ]
+              },
+              "sources": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "evidence": {
+                "type": "string"
+              },
+              "vote": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "caveats": {
+          "type": "string"
+        },
+        "open_questions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "critic": {
+      "type": "object",
+      "required": [
+        "coverage",
+        "underCovered",
+        "suggestedFollowUps"
+      ],
+      "properties": {
+        "coverage": {
+          "enum": [
+            "complete",
+            "partial",
+            "thin"
+          ]
+        },
+        "underCovered": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "suggestedFollowUps": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "required": [
+              "gap",
+              "query"
+            ],
+            "properties": {
+              "gap": {
+                "type": "string"
+              },
+              "query": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "prompts": {
+    "scope": "Decompose this research question into complementary search angles, and judge how much depth it warrants.\n\n## Question\n$question\n\n## Task\n1. Classify the research depth this question needs:\n   - shallow: a straightforward factual or lookup question; a few good sources settle it.\n   - standard: most questions; needs several angles and cross-checking.\n   - deep: contested, high-stakes, fast-moving, or where claims are likely disputed.\n2. Generate up to 6 distinct web search queries covering the question from different angles. Pick angles that suit the domain. Examples: broad/primary, academic/technical, recent news, skeptical/contrarian, practitioner/implementation.\n3. Make queries specific enough to surface high-signal results. Avoid redundancy.\n\nReturn the question, depth tier, 1-2 sentence decomposition summary, and angles. Structured JSON only.",
+    "search": "## Web Searcher: $label\n\nResearch question: \"$question\"\n\nYour angle: $label - $rationale\nSearch query: `$query`\n\n## Task\nUse web search with the query above or a refined version. Return the top 4-6 most relevant results. Rank by relevance to the original question, not just the query. Skip obvious SEO spam and content farms. Include a short snippet capturing why each result matters.\n\nStructured JSON only.",
+    "fetch": "## Source Extractor\n\nResearch question: \"$question\"\n\nFetch and extract key claims from this source:\nURL: $url\nTitle: $title\nFound via: $angle search\n\n$source_context\n\n## Task\n1. Assess source quality: primary research/institution, secondary reporting, blog/opinion, forum, or unreliable.\n2. Extract 2-5 falsifiable claims that bear on the research question. Each claim must be concrete, checkable, supported by a direct quote, and rated central/supporting/tangential.\n3. Note publish date if available.\n4. If the page is irrelevant, paywalled, or unavailable, return claims: [] and sourceQuality: \"unreliable\".\n\nStructured JSON only.",
+    "dedup": "## Claim De-duplicator\n\nResearch question: \"$question\"\n\nBelow are raw claims extracted from multiple sources. Many say the same thing in different words.\n\n## Raw claims\n$claims_block\n\n## Task\nMerge claims that assert the same fact into one claim each. For every merged claim: write the clearest phrasing, keep one representative supporting quote, list all source URLs, carry the highest importance, and carry the best source quality. Do not invent claims or merge claims that differ in substance or degree.\n\nStructured JSON only.",
+    "verify": "## Adversarial Claim Verifier (vote $vote/$total)\n\nBe skeptical. Your job is to try to refute this claim.\n\n## Research question\n$question\n\n## Claim under review\n\"$claim\"\n\nImportance: $importance\nSources ($source_count): $source_urls (best quality: $source_quality)\nSupporting quote: \"$quote\"\n\n## How to adjudicate\n1. Internal check: does the quote actually support the claim, or is it overreach? Is the source quality sufficient? Is it outdated, marketing, or cherry-picked?\n2. Web search only if warranted: search for contradicting evidence only when the claim is central and its best source is weak, or when the claim is extraordinary. Otherwise decide from the quote and source quality. Set searched to whether you actually searched.\n\nrefuted=true if unsupported by the quote, contradicted, weakly sourced for its strength, outdated, or marketing fluff. refuted=false only if well-supported, current enough, and source quality matches claim strength. Default to refuted=true if genuinely uncertain.\n\nStructured JSON only.",
+    "synthesize": "## Synthesis: research report\n\nQuestion: $question\n\n$confirmed_count claims survived adversarial verification. Group them into coherent findings that answer the question.\n\n## Confirmed claims\n$confirmed_block\n\n## Refuted or unverified claims\n$killed_block\n\n## Instructions\n1. Group related claims into coherent findings that directly answer the research question.\n2. Assign confidence: high for strong independent sourcing and clean votes, medium for thinner sourcing or some uncertainty, low for single-source or weak-source findings.\n3. Write a 3-5 sentence executive summary.\n4. Note caveats, source weakness, and time sensitivity.\n5. List 2-4 open questions if useful.\n\nStructured JSON only.",
+    "critic": "## Completeness Critic\n\nResearch question: $question\n\nAngles searched: $angles\nAngles that produced confirmed findings: $answered_angles\n\nReport summary: $summary\nFindings: $findings\n\n## Task\nJudge whether these findings actually answer the original question.\n- coverage: complete, partial, or thin.\n- underCovered: aspects left unaddressed.\n- suggestedFollowUps: up to 3 concrete search queries to close gaps.\n\nStructured JSON only."
+  }
+}

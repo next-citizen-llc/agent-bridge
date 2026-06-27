@@ -1,1 +1,2 @@
 include agent_bridge/agents.json
+recursive-include agent_bridge/workflows *.json

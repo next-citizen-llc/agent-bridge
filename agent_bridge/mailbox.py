@@ -88,8 +88,22 @@ def filter_messages(
     unread_only: bool = False,
     run_id: str | None = None,
     loop_id: str | None = None,
+    turn_id: str | None = None,
+    parent_id: str | None = None,
+    attempt: int | None = None,
+    role: str | None = None,
+    meta_filters: dict | None = None,
 ) -> list[dict]:
-    filters = {"run_id": run_id, "loop_id": loop_id}
+    filters = {
+        "run_id": run_id,
+        "loop_id": loop_id,
+        "turn_id": turn_id,
+        "parent_id": parent_id,
+        "attempt": attempt,
+        "role": role,
+    }
+    if meta_filters:
+        filters.update(meta_filters)
     msgs = _load()
     if to:
         msgs = [m for m in msgs if m["to"] == to]
@@ -98,11 +112,11 @@ def filter_messages(
     return [m for m in msgs if match_meta(m, filters)]
 
 
-def mark_read(message_id: str) -> dict | None:
+def mark_read(message_id: str, *, meta_filters: dict | None = None) -> dict | None:
     msgs = _load()
     found = None
     for msg in msgs:
-        if msg["id"] == message_id:
+        if msg["id"] == message_id and match_meta(msg, meta_filters or {}):
             found = msg
             msg["status"] = "read"
     if found is not None:
@@ -132,12 +146,8 @@ def _print(m: dict, full: bool) -> None:
     print("  " + body.replace("\n", "\n  "))
 
 
-def _filters(a) -> dict:
-    return {"run_id": getattr(a, "run_id", None), "loop_id": getattr(a, "loop_id", None)}
-
-
 def cmd_read(a) -> int:
-    msgs = filter_messages(to=a.to, run_id=a.run_id, loop_id=a.loop_id)
+    msgs = filter_messages(to=a.to, meta_filters=extract_meta(a))
     for m in msgs:
         _print(m, a.full)
     if not msgs:
@@ -146,7 +156,7 @@ def cmd_read(a) -> int:
 
 
 def cmd_last(a) -> int:
-    msgs = filter_messages(to=a.to, run_id=a.run_id, loop_id=a.loop_id)
+    msgs = filter_messages(to=a.to, meta_filters=extract_meta(a))
     if not msgs:
         print("(no matching message)")
         return 1

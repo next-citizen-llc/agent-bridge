@@ -15,6 +15,14 @@
       "command": "codex",
       "env_command": "CODEX_BIN",
       "description": "OpenAI Codex headless CLI"
+    },
+    {
+      "id": "gemini",
+      "label": "Gemini CLI",
+      "adapter": "gemini_cli",
+      "command": "gemini",
+      "env_command": "GEMINI_BIN",
+      "description": "Google Gemini CLI agent harness"
     }
   ]
 }

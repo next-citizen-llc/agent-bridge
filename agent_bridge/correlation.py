@@ -47,7 +47,8 @@ def merge_meta(*sources: Mapping[str, Any] | object | None, **overrides: Any) ->
 
 
 def add_meta_args(parser, *, filters_only: bool = False) -> None:
-    for field in META_FIELDS:
+    fields = ("run_id", "loop_id") if filters_only else META_FIELDS
+    for field in fields:
         kwargs = {"dest": field, "default": None}
         if field == "attempt":
             kwargs["type"] = int

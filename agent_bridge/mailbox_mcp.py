@@ -38,15 +38,6 @@ except ImportError:
 
 PROTO = "2024-11-05"
 
-META_PROPS = {
-    "run_id": {"type": "string", "description": "Optional correlation: run identifier."},
-    "loop_id": {"type": "string", "description": "Optional correlation: loop identifier."},
-    "turn_id": {"type": "string", "description": "Optional correlation: turn identifier."},
-    "parent_id": {"type": "string", "description": "Optional correlation: parent id."},
-    "attempt": {"type": "integer", "description": "Optional correlation: attempt number."},
-    "role": {"type": "string", "description": "Optional correlation: role."},
-}
-
 TOOLS = [
     {
         "name": "mailbox_send",
@@ -60,7 +51,12 @@ TOOLS = [
                 "subject": {"type": "string"},
                 "body": {"type": "string"},
                 "ref": {"type": "string", "description": "Optional id of the message this replies to."},
-                **META_PROPS,
+                "run_id": {"type": "string", "description": "Optional correlation: run identifier."},
+                "loop_id": {"type": "string", "description": "Optional correlation: loop identifier."},
+                "turn_id": {"type": "string", "description": "Optional correlation: turn identifier."},
+                "parent_id": {"type": "string", "description": "Optional correlation: parent id."},
+                "attempt": {"type": "integer", "description": "Optional correlation: attempt number."},
+                "role": {"type": "string", "description": "Optional correlation: sender role."},
             },
         },
     },
@@ -73,7 +69,8 @@ TOOLS = [
             "properties": {
                 "to": {"type": "string"},
                 "unread_only": {"type": "boolean"},
-                **META_PROPS,
+                "run_id": {"type": "string", "description": "Optional filter: only this run_id."},
+                "loop_id": {"type": "string", "description": "Optional filter: only this loop_id."},
             },
         },
     },
@@ -83,7 +80,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "required": ["id"],
-            "properties": {"id": {"type": "string"}, **META_PROPS},
+            "properties": {"id": {"type": "string"}},
         },
     },
 ]
@@ -187,7 +184,8 @@ def _inbox(args):
     msgs = mb.filter_messages(
         to=args["to"],
         unread_only=args.get("unread_only", False),
-        meta_filters=extract_meta(args),
+        run_id=args.get("run_id"),
+        loop_id=args.get("loop_id"),
     )
     for m in msgs:
         meta = m.get("meta") or {}
@@ -197,7 +195,7 @@ def _inbox(args):
 
 
 def _read(args):
-    found = mb.mark_read(args["id"], meta_filters=extract_meta(args))
+    found = mb.mark_read(args["id"])
     if found is not None:
         return json.dumps(found, indent=2)
     return f'no message {args["id"]}'

@@ -60,15 +60,19 @@ TRANSCRIPT_DIR = STATE_DIR / "transcripts"
 BRIDGE_LOG = STATE_DIR / "bridge_agents.log"
 MEDIA_DIR = STATE_DIR / "media"
 CONNECTION_STATE = STATE_DIR / "connections.json"
+CLAUDE_AUTH_STATE = STATE_DIR / "claude-auth.json"
 PROJECT_DIR = Path.cwd()
 SHARED_BRIDGE_DIR_NAME = "Agent-Bridge"
 SHARED_REGISTRY_DIR_NAME = "registry"
 SHARED_SKILL_LINK_NAME = "agent-bridge"
+SKILLS_VAULT_DEFAULT = Path(os.environ.get("AGENT_BRIDGE_SKILLS_VAULT", Path.home() / "Code/skills-vault")).expanduser()
 DEFAULT_BUDGET_USD = "0.50"
 DEFAULT_REPAIR_BUDGET_USD = "0.05"
 DEFAULT_MAX_AUTO_BUDGET_USD = "1.00"
 BUDGET_RETRY_LADDER = [0.10, 0.20, 0.50, 1.00, 2.00, 5.00]
 HEIC_SUFFIXES = {".heic", ".heif"}
+ANTHROPIC_ENV_NAMES = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
+SKILLS_CLIENTS = ("codex", "claude", "agents", "grok")
 QUOTED_HEIC_PATH_RE = re.compile(
     r"""(?P<quote>['"`])(?P<path>(?:file://)?(?:~|/|\.{1,2}/|[A-Za-z]:[\\/])[^'"`\n]*?\.(?:heic|heif))(?P=quote)""",
     re.IGNORECASE,
@@ -578,7 +582,7 @@ Git status at dispatch:
 
 Task contract: {action}.{no_edit}
 
-Hard limits: no live production actions, no credential use, no deploy, no teardown, no browser
+Hard limits: no live Domino actions, no credential use, no deploy, no teardown, no browser
 automation unless explicitly requested for local UI verification, no direct GitHub push, and no
 secrets. Keep changes scoped to this worktree, preserve the repo's generic/de-identified
 positioning, and report files changed plus verification performed.
@@ -636,6 +640,22 @@ def command_for_agent(
             "-s",
             sandbox,
         ]
+    if adapter == "gemini_cli":
+        approval_mode = "yolo" if mode == "code" else "plan"
+        combined_prompt = f"{scope}\n\n[BRIDGE REQUEST FROM {source}]\n{prompt}"
+        cmd = [
+            command,
+            "-p",
+            combined_prompt,
+            "--approval-mode",
+            approval_mode,
+            "--output-format",
+            "text",
+            "--skip-trust",
+        ]
+        for d in [str(PROJECT_DIR)] + [str(m) for m in media_dirs]:
+            cmd.extend(["--include-directories", d])
+        return cmd
     if adapter == "argv":
         templates = agent.get(f"{mode}_args") or agent.get("args")
         if not isinstance(templates, list):
@@ -760,6 +780,16 @@ def invoke_target(
     max_auto_budget_usd: str = DEFAULT_MAX_AUTO_BUDGET_USD,
 ) -> int:
     budget = calibrated_budget(agent["id"], budget_usd, enabled=budget_auto and not dry_run)
+    if agent.get("id") == "claude" and not dry_run:
+        preflight = claude_auth_preflight(resolve_command(agent))
+        if preflight.get("ok") is not True:
+            record_agent_connection("claude", last_status="auth_preflight_failed", last_error=preflight.get("status"))
+            print(
+                "[agent-bridge] claude: auth preflight failed "
+                f"({preflight.get('status')}). Run `agent code repair --to claude --repair-auth` if interactive repair is needed.",
+                file=sys.stderr,
+            )
+            return 1
     while True:
         result = _invoke_target_once(
             agent,
@@ -894,6 +924,204 @@ def _json_print(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
+def _read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_json_file(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _git_output(repo: Path, args: list[str]) -> str:
+    try:
+        return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.DEVNULL, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
+def skills_vault_repo(repo: str | None = None) -> Path:
+    return Path(repo).expanduser().resolve() if repo else SKILLS_VAULT_DEFAULT.resolve()
+
+
+def skills_vault_git_status(repo: Path) -> dict[str, Any]:
+    if not (repo / ".git").exists():
+        return {"path": str(repo), "exists": repo.exists(), "git": False}
+    status = _git_output(repo, ["status", "--short"])
+    return {
+        "path": str(repo),
+        "exists": True,
+        "git": True,
+        "branch": _git_output(repo, ["branch", "--show-current"]),
+        "commit": _git_output(repo, ["rev-parse", "HEAD"]),
+        "short_commit": _git_output(repo, ["rev-parse", "--short", "HEAD"]),
+        "dirty": bool(status),
+        "status": status,
+    }
+
+
+def load_skills_registry(repo: Path) -> dict[str, Any]:
+    registry_path = repo / "registry" / "skills.json"
+    if not registry_path.exists():
+        raise BridgeError(f"missing skills registry: {registry_path}")
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"{registry_path} is not valid JSON: {exc}") from exc
+    if not isinstance(registry, dict) or not isinstance(registry.get("skills"), list):
+        raise BridgeError(f"{registry_path} must contain a skills list")
+    return registry
+
+
+def validate_skills_registry(repo: Path) -> list[str]:
+    registry = load_skills_registry(repo)
+    errors: list[str] = []
+    seen: set[str] = set()
+    required = {
+        "id",
+        "aliases",
+        "description",
+        "source_paths",
+        "harnesses",
+        "platforms",
+        "install_mode",
+        "dependencies",
+        "sensitivity",
+        "status",
+        "content_hash",
+    }
+    for entry in registry.get("skills", []):
+        if not isinstance(entry, dict):
+            errors.append("skill entry must be an object")
+            continue
+        skill_id = entry.get("id")
+        if not isinstance(skill_id, str) or not skill_id:
+            errors.append("skill entry missing id")
+            continue
+        if skill_id in seen:
+            errors.append(f"{skill_id}: duplicate id")
+        seen.add(skill_id)
+        missing = sorted(required - set(entry))
+        if missing:
+            errors.append(f"{skill_id}: missing {', '.join(missing)}")
+        if entry.get("status") not in {"active", "inactive", "deprecated"}:
+            errors.append(f"{skill_id}: unsupported status {entry.get('status')!r}")
+        skill_dir = repo / "skills" / skill_id
+        if entry.get("status") == "active" and not (skill_dir / "SKILL.md").exists():
+            errors.append(f"{skill_id}: missing SKILL.md")
+    return errors
+
+
+def client_skill_roots(client: str) -> list[Path]:
+    home = Path.home()
+    if client == "codex":
+        return [home / ".codex" / "skills"]
+    if client == "claude":
+        return [home / ".claude" / "skills"]
+    if client == "agents":
+        return [home / ".agents" / "skills"]
+    if client == "grok":
+        return [home / ".grok" / "skills"]
+    if client == "all":
+        roots: list[Path] = []
+        for item in SKILLS_CLIENTS:
+            roots.extend(client_skill_roots(item))
+        return roots
+    raise BridgeError(f"unsupported skills client {client!r}")
+
+
+def active_registry_skills(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        entry
+        for entry in registry.get("skills", [])
+        if isinstance(entry, dict) and entry.get("status") == "active" and entry.get("install_mode") == "symlink"
+    ]
+
+
+def ensure_skill_symlink(link_path: Path, target: Path, *, dry_run: bool = False) -> dict[str, str]:
+    if link_path.exists() or link_path.is_symlink():
+        if link_path.is_symlink():
+            try:
+                if link_path.resolve() == target.resolve():
+                    return {"path": str(link_path), "target": str(target), "status": "already linked"}
+            except OSError:
+                pass
+            if dry_run:
+                return {"path": str(link_path), "target": str(target), "status": "would relink"}
+            link_path.unlink()
+            os.symlink(target, link_path, target_is_directory=True)
+            return {"path": str(link_path), "target": str(target), "status": "relinked"}
+        return {"path": str(link_path), "target": str(target), "status": "exists; left unchanged"}
+    if dry_run:
+        return {"path": str(link_path), "target": str(target), "status": "would link"}
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(target, link_path, target_is_directory=True)
+    return {"path": str(link_path), "target": str(target), "status": "linked"}
+
+
+def install_vault_skills(repo: Path, *, client: str, dry_run: bool = False) -> dict[str, Any]:
+    registry = load_skills_registry(repo)
+    roots = client_skill_roots(client)
+    results = []
+    for root in roots:
+        root_client = root.parent.name.lstrip(".")
+        for entry in active_registry_skills(registry):
+            skill_id = str(entry["id"])
+            target = repo / "skills" / skill_id
+            if not target.exists():
+                results.append({"client": root_client, "skill": skill_id, "path": str(root / skill_id), "status": "missing target"})
+                continue
+            link = ensure_skill_symlink(root / skill_id, target, dry_run=dry_run)
+            link.update({"client": root_client, "skill": skill_id})
+            results.append(link)
+    return {
+        "repo": str(repo),
+        "dry_run": dry_run,
+        "skills": len(active_registry_skills(registry)),
+        "roots": [str(root) for root in roots],
+        "results": results,
+    }
+
+
+def skills_install_status(repo: Path, *, client: str) -> dict[str, Any]:
+    registry = load_skills_registry(repo)
+    roots = client_skill_roots(client)
+    rows = []
+    for root in roots:
+        root_client = root.parent.name.lstrip(".")
+        for entry in active_registry_skills(registry):
+            skill_id = str(entry["id"])
+            target = repo / "skills" / skill_id
+            link = root / skill_id
+            if link.is_symlink():
+                try:
+                    status = "linked" if link.resolve() == target.resolve() else "legacy symlink"
+                except OSError:
+                    status = "broken symlink"
+            elif link.exists():
+                status = "real path conflict"
+            else:
+                status = "missing"
+            rows.append({"client": root_client, "skill": skill_id, "path": str(link), "target": str(target), "status": status})
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    return {"repo": str(repo), "vault": skills_vault_git_status(repo), "counts": counts, "results": rows}
+
+
+def format_skills_status(data: dict[str, Any]) -> str:
+    lines = [f"Skills vault: {data['repo']}", f"Commit: {data.get('vault', {}).get('short_commit', '')}", "Status counts:"]
+    for key, value in sorted(data.get("counts", {}).items()):
+        lines.append(f"- {key}: {value}")
+    return "\n".join(lines) + "\n"
+
+
 def _comma_values(values: list[str] | None) -> list[str]:
     if not values:
         return []
@@ -904,7 +1132,8 @@ def _comma_values(values: list[str] | None) -> list[str]:
 
 
 def _hook_agent_command(client: str) -> str:
-    agent_bin = os.environ.get("AGENT_BRIDGE_HOOK_AGENT", os.path.expanduser("~/.local/bin/agent"))
+    default_agent = str(Path.home() / ".local" / "bin" / "agent")
+    agent_bin = os.environ.get("AGENT_BRIDGE_HOOK_AGENT", default_agent)
     if agent_bin.lower().endswith((".cmd", ".bat")) or "\\" in agent_bin:
         return f'cmd /d /c ""{agent_bin}" code hook session-start --client {client}"'
     return f"'{agent_bin}' code hook session-start --client {client}"
@@ -944,12 +1173,13 @@ def shared_skills_root_candidates() -> list[Path]:
         value = os.environ.get(name)
         if value:
             candidates.append(Path(value) / "SharedAgentSkills")
-    candidates.extend(
-        [
-            home / "Library" / "CloudStorage" / "OneDrive-Personal" / "SharedAgentSkills",
-            home / "OneDrive" / "SharedAgentSkills",
-        ]
-    )
+    cloud_storage = home / "Library" / "CloudStorage"
+    if cloud_storage.is_dir():
+        candidates.extend(
+            sorted(entry / "SharedAgentSkills" for entry in cloud_storage.glob("OneDrive-*"))
+        )
+    candidates.extend(sorted(home.glob("OneDrive - */SharedAgentSkills")))
+    candidates.append(home / "OneDrive" / "SharedAgentSkills")
     return _dedupe_paths(candidates)
 
 
@@ -1049,6 +1279,18 @@ def register_harness(client: str, *, root: str | None = None, status: str = "act
         "shared_bridge_dir": str(bridge_dir),
         "registry_file": str(path),
     }
+    vault_status = skills_vault_git_status(SKILLS_VAULT_DEFAULT)
+    if vault_status.get("exists"):
+        record["skills_vault"] = vault_status
+    if client == "claude":
+        auth_state = cached_claude_auth_state()
+        if auth_state:
+            record["claude_auth"] = {
+                "ok": auth_state.get("ok"),
+                "status": auth_state.get("status"),
+                "checked_at": auth_state.get("checked_at"),
+                "cached": True,
+            }
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(path)
@@ -1148,6 +1390,74 @@ def _run_capture(cmd: list[str], *, cwd: Path | None = None, timeout: int = 60) 
         return AgentRunResult(return_code=124, output=output or f"timed out after {timeout}s")
 
 
+def _state_is_fresh(row: dict[str, Any], ttl_seconds: int) -> bool:
+    checked = _parse_iso_timestamp(row.get("checked_at"))
+    if checked is None:
+        return False
+    age = (dt.datetime.now(dt.timezone.utc) - checked).total_seconds()
+    return age <= ttl_seconds
+
+
+def _credential_presence() -> dict[str, Any]:
+    if platform.system() == "Darwin" and shutil.which("security"):
+        result = _run_capture(["security", "find-generic-password", "-s", "Claude Code-credentials"], timeout=10)
+        return {"backend": "macos-keychain", "present": result.return_code == 0}
+    path = Path.home() / ".claude" / ".credentials.json"
+    return {"backend": "file", "present": path.exists(), "path": str(path)}
+
+
+def _run_claude_ready_probe(command: str) -> AgentRunResult:
+    prompt = "Reply with exactly READY"
+    primary = _run_capture([command, "-p", prompt, "--max-turns", "1"], timeout=20)
+    if primary.return_code == 0 or "unknown option" not in primary.output.lower():
+        return primary
+    return _run_capture([command, "-p", prompt, "--max-budget-usd", "0.20", "--output-format", "text"], timeout=20)
+
+
+def claude_auth_preflight(command: str, *, refresh: bool = False, ttl_seconds: int = 21600) -> dict[str, Any]:
+    if os.environ.get("AGENT_BRIDGE_AUTH_PREFLIGHT") in {"0", "false", "FALSE", "no"}:
+        return {"status": "skipped", "ok": True, "checked_at": iso_now(), "reason": "disabled by AGENT_BRIDGE_AUTH_PREFLIGHT"}
+    cached = _read_json_file(CLAUDE_AUTH_STATE)
+    if not refresh and cached.get("ok") is True and _state_is_fresh(cached, ttl_seconds):
+        cached["cached"] = True
+        return cached
+
+    poisoned_env = [name for name in ANTHROPIC_ENV_NAMES if os.environ.get(name)]
+    credential = _credential_presence()
+    version = _run_capture([command, "--version"], timeout=10)
+    payload: dict[str, Any] = {
+        "schema_version": "1.0",
+        "checked_at": iso_now(),
+        "method": "claude-ready-probe",
+        "command": command,
+        "version": (version.output or "").strip().splitlines()[:1],
+        "credential": credential,
+        "poisoned_env": poisoned_env,
+        "cached": False,
+    }
+    if poisoned_env:
+        payload.update({"ok": False, "status": "env_misconfigured", "error": "ANTHROPIC_* environment variables are set"})
+        _write_json_file(CLAUDE_AUTH_STATE, payload)
+        return payload
+    probe = _run_claude_ready_probe(command)
+    ok = probe.return_code == 0 and "READY" in probe.output
+    payload.update(
+        {
+            "ok": ok,
+            "status": "ok" if ok else "probe_failed",
+            "return_code": probe.return_code,
+            "error": "" if ok else (probe.output or "")[:500],
+        }
+    )
+    _write_json_file(CLAUDE_AUTH_STATE, payload)
+    return payload
+
+
+def cached_claude_auth_state() -> dict[str, Any] | None:
+    data = _read_json_file(CLAUDE_AUTH_STATE)
+    return data or None
+
+
 def _claude_auth_status(command: str) -> tuple[dict[str, Any] | None, str]:
     result = _run_capture([command, "auth", "status"], timeout=30)
     if result.return_code != 0:
@@ -1182,12 +1492,14 @@ def _budgeted_probe(
     max_auto_budget_usd: str,
 ) -> ProbeResult:
     command = resolve_command(agent)
+    adapter = agent.get("adapter")
     budget = calibrated_budget(agent["id"], budget_usd, enabled=True)
     while True:
-        result = _run_capture(
-            [command, "-p", prompt, "--max-budget-usd", budget, "--output-format", "text"],
-            timeout=120,
-        )
+        if adapter == "gemini_cli":
+            probe_cmd = [command, "-p", prompt, "--output-format", "text", "--skip-trust"]
+        else:
+            probe_cmd = [command, "-p", prompt, "--max-budget-usd", budget, "--output-format", "text"]
+        result = _run_capture(probe_cmd, timeout=120)
         if result.return_code == 0 and expected in result.output:
             record_agent_connection(agent["id"], direct_budget_usd=_format_budget(budget), last_direct_status="ok")
             return ProbeResult(ok=True, budget_usd=_format_budget(budget), output=result.output)
@@ -1396,10 +1708,12 @@ def _skill_link_paths(client: str) -> list[Path]:
         return [home / ".codex" / "skills" / SHARED_SKILL_LINK_NAME]
     if client == "claude":
         return [home / ".claude" / "skills" / SHARED_SKILL_LINK_NAME]
+    if client == "gemini":
+        return [home / ".gemini" / "skills" / SHARED_SKILL_LINK_NAME]
     if client == "agents":
         return [home / ".agents" / "skills" / SHARED_SKILL_LINK_NAME]
     if client == "all":
-        return _skill_link_paths("codex") + _skill_link_paths("claude") + _skill_link_paths("agents")
+        return _skill_link_paths("codex") + _skill_link_paths("claude") + _skill_link_paths("gemini") + _skill_link_paths("agents")
     return []
 
 
@@ -1456,6 +1770,12 @@ def session_start_context(client: str, registration: dict[str, Any] | None = Non
             " Shared registry heartbeat written to "
             f"`{registration['registry_file']}` for machine `{registration['machine_id']}`."
         )
+        vault = registration.get("skills_vault")
+        if isinstance(vault, dict) and vault.get("short_commit"):
+            registry += f" Skills vault: `{vault.get('short_commit')}`{' dirty' if vault.get('dirty') else ''}."
+        auth = registration.get("claude_auth")
+        if isinstance(auth, dict):
+            registry += f" Cached Claude auth: {auth.get('status')} at {auth.get('checked_at')}."
     return (
         "Agent Bridge session bootstrap: global command `agent` is available for bounded local "
         "agent coordination. Use `agent code bridge` for one-shot headless review/code turns and "
@@ -1463,14 +1783,16 @@ def session_start_context(client: str, registration: dict[str, Any] | None = Non
         "which falls back to one analysis-only adversarial agent unless the task is concrete enough "
         "for a full builder/critic/verifier spawn. Mailbox MCP, when registered, should point to "
         f"`{BRIDGE_DIR / 'mailbox_mcp.py'}`. Use `agent code harness status` to inspect shared "
-        f"OneDrive harness registrations. This startup hook never spawns agents. Client: {client}."
+        "OneDrive harness registrations. Use `agent code skills status` to inspect Git-backed "
+        "skill installs. This startup hook never spawns agents or performs Claude login. "
+        f"Client: {client}."
         f"{location}{registry}"
     )
 
 
 def hook_session_start(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="agent code hook session-start", description="Emit SessionStart hook context.")
-    parser.add_argument("--client", choices=["codex", "claude"], required=True)
+    parser.add_argument("--client", choices=["codex", "claude", "gemini"], required=True)
     parser.add_argument("--plain", action="store_true", help="Print plain context instead of hook JSON")
     args = parser.parse_args(argv)
     registration = maybe_register_harness(args.client)
@@ -1539,10 +1861,17 @@ def _config_path(client: str) -> Path:
         return home / ".codex" / "hooks.json"
     if client == "claude":
         return home / ".claude" / "settings.json"
+    if client == "gemini":
+        return home / ".gemini" / "settings.json"
     raise BridgeError(f"unsupported hook client {client!r}")
 
 
 def install_session_hook(client: str) -> bool:
+    if client == "gemini":
+        # Gemini uses different hook events (BeforeAgent / AfterTool etc). Bridge context is
+        # injected directly into headless prompts. Run `gemini` interactively for full setup.
+        print("gemini: hooks use project/agent model (see `gemini hooks`). Bridge coordination injected via prompts.")
+        return False
     path = _config_path(client)
     default = {"hooks": {}} if client == "codex" else {}
     config = _load_json_config(path, default)
@@ -1553,6 +1882,8 @@ def install_session_hook(client: str) -> bool:
 
 
 def session_hook_installed(client: str) -> bool:
+    if client == "gemini":
+        return False  # different hook system; status reported at install time
     path = _config_path(client)
     if not path.exists():
         return False
@@ -1569,12 +1900,12 @@ def hooks_cmd(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="agent code hooks", description="Install or inspect Agent Bridge session hooks.")
     sub = parser.add_subparsers(dest="cmd", required=True)
     install = sub.add_parser("install")
-    install.add_argument("--client", choices=["codex", "claude", "both"], default="both")
+    install.add_argument("--client", choices=["codex", "claude", "gemini", "both"], default="both")
     status = sub.add_parser("status")
-    status.add_argument("--client", choices=["codex", "claude", "both"], default="both")
+    status.add_argument("--client", choices=["codex", "claude", "gemini", "both"], default="both")
     args = parser.parse_args(argv)
 
-    clients = ["codex", "claude"] if args.client == "both" else [args.client]
+    clients = ["codex", "claude", "gemini"] if args.client == "both" else [args.client]
     if args.cmd == "install":
         for client in clients:
             changed = install_session_hook(client)
@@ -1619,6 +1950,120 @@ def harness_cmd(argv: list[str]) -> int:
     data = load_harness_registry(args.root, stale_minutes=args.stale_minutes)
     _json_print(data) if args.json else print(format_harness_registry(data), end="")
     return 0
+
+
+def skills_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code skills", description="Inspect and install Git-backed skill vault packages.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    inventory = sub.add_parser("inventory", help="Show the skills-vault registry inventory.")
+    inventory.add_argument("--repo", default=str(SKILLS_VAULT_DEFAULT))
+    inventory.add_argument("--json", action="store_true")
+
+    validate = sub.add_parser("validate", help="Validate the skills-vault registry.")
+    validate.add_argument("--repo", default=str(SKILLS_VAULT_DEFAULT))
+    validate.add_argument("--json", action="store_true")
+
+    install = sub.add_parser("install", help="Link active skills into local harness skill roots.")
+    install.add_argument("--repo", default=str(SKILLS_VAULT_DEFAULT))
+    install.add_argument("--client", choices=[*SKILLS_CLIENTS, "all"], default="all")
+    install.add_argument("--dry-run", action="store_true")
+    install.add_argument("--json", action="store_true")
+
+    status = sub.add_parser("status", help="Show local install status for active skills.")
+    status.add_argument("--repo", default=str(SKILLS_VAULT_DEFAULT))
+    status.add_argument("--client", choices=[*SKILLS_CLIENTS, "all"], default="all")
+    status.add_argument("--json", action="store_true")
+
+    sync = sub.add_parser("sync", help="Fast-forward the skills-vault checkout, optionally installing afterward.")
+    sync.add_argument("--repo", default=str(SKILLS_VAULT_DEFAULT))
+    sync.add_argument("--client", choices=[*SKILLS_CLIENTS, "all"], default="all")
+    sync.add_argument("--ff-only", action="store_true")
+    sync.add_argument("--install", action="store_true")
+    sync.add_argument("--dry-run", action="store_true")
+    sync.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    repo = skills_vault_repo(args.repo)
+
+    if args.cmd == "inventory":
+        registry = load_skills_registry(repo)
+        active = [entry for entry in registry["skills"] if isinstance(entry, dict) and entry.get("status") == "active"]
+        data = {"repo": str(repo), "vault": skills_vault_git_status(repo), "total": len(registry["skills"]), "active": len(active), "skills": registry["skills"]}
+        if args.json:
+            _json_print(data)
+        else:
+            print(f"{data['total']} skills ({data['active']} active) in {repo}")
+            for entry in registry["skills"]:
+                print(f"{entry.get('status', '')}\t{entry.get('id', '')}\t{','.join(entry.get('harnesses', []))}")
+        return 0
+
+    if args.cmd == "validate":
+        errors = validate_skills_registry(repo)
+        data = {"repo": str(repo), "ok": not errors, "errors": errors}
+        if args.json:
+            _json_print(data)
+        elif errors:
+            for item in errors:
+                print(f"ERROR: {item}", file=sys.stderr)
+        else:
+            print(f"validated skills registry: {repo}")
+        return 0 if not errors else 1
+
+    if args.cmd == "install":
+        result = install_vault_skills(repo, client=args.client, dry_run=args.dry_run)
+        if args.json:
+            _json_print(result)
+        else:
+            changed = [row for row in result["results"] if row["status"] in {"linked", "relinked", "would link", "would relink"}]
+            conflicts = [row for row in result["results"] if row["status"] == "exists; left unchanged"]
+            print(f"{len(changed)} link actions; {len(conflicts)} real-path conflicts; repo={repo}")
+        return 0
+
+    if args.cmd == "status":
+        data = skills_install_status(repo, client=args.client)
+        _json_print(data) if args.json else print(format_skills_status(data), end="")
+        return 0
+
+    if args.dry_run:
+        sync_data: dict[str, Any] = {"repo": str(repo), "dry_run": True, "git": "would pull --ff-only" if args.ff_only else "would pull"}
+    else:
+        pull_cmd = ["git", "-C", str(repo), "pull"]
+        if args.ff_only:
+            pull_cmd.append("--ff-only")
+        result = _run_capture(pull_cmd, cwd=repo, timeout=120)
+        sync_data = {"repo": str(repo), "dry_run": False, "git_return_code": result.return_code, "git_output": result.output}
+        if result.return_code != 0:
+            _json_print(sync_data) if args.json else print(result.output, file=sys.stderr)
+            return result.return_code
+    if args.install:
+        sync_data["install"] = install_vault_skills(repo, client=args.client, dry_run=args.dry_run)
+    _json_print(sync_data) if args.json else print(f"synced {repo}")
+    return 0
+
+
+def auth_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code auth", description="Inspect cached harness auth readiness.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    preflight = sub.add_parser("preflight", help="Refresh auth readiness for a target harness.")
+    preflight.add_argument("--to", choices=["claude"], default="claude")
+    preflight.add_argument("--refresh", action="store_true")
+    preflight.add_argument("--json", action="store_true")
+    status = sub.add_parser("status", help="Show cached auth readiness.")
+    status.add_argument("--to", choices=["claude"], default="claude")
+    status.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.cmd == "status":
+        data = cached_claude_auth_state() or {"ok": False, "status": "missing", "path": str(CLAUDE_AUTH_STATE)}
+    else:
+        agents = agent_map(load_config(DEFAULT_CONFIG))
+        data = claude_auth_preflight(resolve_command(agents["claude"]), refresh=args.refresh)
+    if args.json:
+        _json_print(data)
+    else:
+        print(f"claude auth: {data.get('status')} ({'ok' if data.get('ok') else 'not ok'})")
+    return 0 if data.get("ok") is True else 1
 
 
 def trace_cmd(argv: list[str]) -> int:
@@ -2020,6 +2465,8 @@ def main(argv: list[str]) -> int:
         return loop(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "repair":
         return repair_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "auth":
+        return auth_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "trace":
         return trace_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "findings":
@@ -2032,17 +2479,21 @@ def main(argv: list[str]) -> int:
         return hooks_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "harness":
         return harness_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "skills":
+        return skills_cmd(argv[2:])
     if len(argv) >= 1 and argv[0] == "bridge":
         return bridge(argv[1:])
     print("usage: agent code bridge [options]", file=sys.stderr)
     print("       agent code loop [options]", file=sys.stderr)
     print("       agent code repair [options]", file=sys.stderr)
+    print("       agent code auth <preflight|status> [options]", file=sys.stderr)
     print("       agent code trace [options]", file=sys.stderr)
     print("       agent code findings <create|list|read> [options]", file=sys.stderr)
     print("       agent code verdicts <record|list> [options]", file=sys.stderr)
     print("       agent code hook session-start [options]", file=sys.stderr)
     print("       agent code hooks <install|status> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
+    print("       agent code skills <inventory|validate|install|status|sync> [options]", file=sys.stderr)
     print("       agent workflow <list|show|run|inspect> [options]", file=sys.stderr)
     print("       agent bridge [options]", file=sys.stderr)
     return 2

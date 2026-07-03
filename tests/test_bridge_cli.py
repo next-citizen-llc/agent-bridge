@@ -42,6 +42,9 @@ class BridgeCliTests(unittest.TestCase):
             "    raise SystemExit(0)\n"
             "if '-p' in args:\n"
             "    prompt = args[args.index('-p') + 1]\n"
+            "    if 'READY' in prompt and '--max-turns' in args:\n"
+            "        print('READY')\n"
+            "        raise SystemExit(0)\n"
             "    budget = '0'\n"
             "    if '--max-budget-usd' in args:\n"
             "        budget = args[args.index('--max-budget-usd') + 1]\n"
@@ -486,73 +489,6 @@ class BridgeCliTests(unittest.TestCase):
         self.assertEqual(dispatched["parent_id"], "parent-turn")
         self.assertNotEqual(dispatched["turn_id"], "caller-turn")
 
-    def test_bridge_writes_correlation_to_transcript_header_and_filename(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "agents.json"
-            state = Path(tmp) / "state"
-            config.write_text(
-                json.dumps(
-                    {
-                        "agents": [
-                            {
-                                "id": "helper",
-                                "label": "Helper",
-                                "adapter": "argv",
-                                "command": "python3",
-                                "args": ["-c", "print('agent output')"],
-                            }
-                        ]
-                    }
-                ),
-                encoding="utf-8",
-            )
-            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(state)}
-            proc = subprocess.run(
-                [
-                    str(AGENT),
-                    "code",
-                    "bridge",
-                    "--config",
-                    str(config),
-                    "--from",
-                    "human",
-                    "--to",
-                    "helper",
-                    "--mode",
-                    "review",
-                    "--prompt",
-                    "transcript smoke",
-                    "--run-id",
-                    "run.transcript",
-                    "--loop-id",
-                    "loop.transcript",
-                    "--parent-id",
-                    "parent-transcript",
-                    "--attempt",
-                    "3",
-                ],
-                cwd=str(ROOT),
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            transcripts = list((state / "transcripts").glob("*.txt"))
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(len(transcripts), 1)
-            transcript_name = transcripts[0].name
-            text = transcripts[0].read_text(encoding="utf-8")
-        self.assertIn("run_transcript_", transcript_name)
-        self.assertIn("_helper_", transcript_name)
-        self.assertIn("correlation: ", text)
-        self.assertIn("run_id=run.transcript", text)
-        self.assertIn("loop_id=loop.transcript", text)
-        self.assertIn("parent_id=parent-transcript", text)
-        self.assertIn("attempt=3", text)
-        self.assertIn("role=helper", text)
-        self.assertRegex(text, r"turn_id=turn_helper_")
-
     def test_session_start_hook_outputs_context_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             shared_root = Path(tmp) / "SharedAgentSkills"
@@ -643,6 +579,168 @@ class BridgeCliTests(unittest.TestCase):
             self.assertEqual(codex_link.resolve(), (shared_root / "Agent-Bridge").resolve())
             self.assertEqual(claude_link.resolve(), (shared_root / "Agent-Bridge").resolve())
             self.assertEqual(agents_link.resolve(), (shared_root / "Agent-Bridge").resolve())
+
+    def _write_fake_skills_vault(self, tmp: str) -> Path:
+        vault = Path(tmp) / "skills-vault"
+        skill = vault / "skills" / "alpha-skill"
+        beta = vault / "skills" / "beta-skill"
+        inactive = vault / "skills" / "inactive-skill"
+        registry = vault / "registry"
+        skill.mkdir(parents=True)
+        beta.mkdir(parents=True)
+        inactive.mkdir(parents=True)
+        registry.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: alpha-skill\ndescription: Alpha test skill.\n---\n", encoding="utf-8")
+        (beta / "SKILL.md").write_text("---\nname: beta-skill\ndescription: Beta test skill.\n---\n", encoding="utf-8")
+        (inactive / "SKILL.md").write_text("---\nname: inactive-skill\n---\n", encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=vault, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        payload = {
+            "schema_version": "1.0",
+            "generated_at": "2026-07-03T00:00:00Z",
+            "source_roots": [],
+            "skills": [
+                {
+                    "id": "alpha-skill",
+                    "aliases": [],
+                    "description": "Alpha test skill.",
+                    "source_paths": [],
+                    "harnesses": ["codex"],
+                    "platforms": ["macos"],
+                    "install_mode": "symlink",
+                    "dependencies": [],
+                    "sensitivity": "private",
+                    "status": "active",
+                    "content_hash": "0" * 64,
+                },
+                {
+                    "id": "beta-skill",
+                    "aliases": [],
+                    "description": "Beta test skill.",
+                    "source_paths": [],
+                    "harnesses": ["codex"],
+                    "platforms": ["macos"],
+                    "install_mode": "symlink",
+                    "dependencies": [],
+                    "sensitivity": "private",
+                    "status": "active",
+                    "content_hash": "2" * 64,
+                },
+                {
+                    "id": "inactive-skill",
+                    "aliases": [],
+                    "description": "Inactive.",
+                    "source_paths": [],
+                    "harnesses": ["codex"],
+                    "platforms": ["macos"],
+                    "install_mode": "symlink",
+                    "dependencies": [],
+                    "sensitivity": "private",
+                    "status": "inactive",
+                    "content_hash": "1" * 64,
+                },
+            ],
+        }
+        (registry / "skills.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return vault
+
+    def test_skills_install_links_active_and_preserves_real_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            vault = self._write_fake_skills_vault(tmp)
+            codex_skills = home / ".codex" / "skills"
+            codex_skills.mkdir(parents=True)
+            (codex_skills / "beta-skill").mkdir()
+            (codex_skills / "beta-skill" / "SKILL.md").write_text("local", encoding="utf-8")
+            env = {**os.environ, "HOME": str(home), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+
+            proc = subprocess.run(
+                [str(AGENT), "code", "skills", "install", "--repo", str(vault), "--client", "codex", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            status = subprocess.run(
+                [str(AGENT), "code", "skills", "status", "--repo", str(vault), "--client", "codex", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            alpha_resolved = (codex_skills / "alpha-skill").resolve()
+            alpha_target = (vault / "skills" / "alpha-skill").resolve()
+            inactive_exists = (codex_skills / "inactive-skill").exists()
+            beta_is_dir = (codex_skills / "beta-skill").is_dir()
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["skills"], 2)
+        self.assertEqual(alpha_resolved, alpha_target)
+        self.assertFalse(inactive_exists)
+        self.assertTrue(beta_is_dir)
+        self.assertIn("exists; left unchanged", {row["status"] for row in payload["results"]})
+        self.assertEqual(status.returncode, 0, status.stderr)
+        status_payload = json.loads(status.stdout)
+        self.assertEqual(status_payload["counts"].get("linked"), 1)
+        self.assertEqual(status_payload["counts"].get("real path conflict"), 1)
+
+    def test_skills_install_relinks_legacy_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            vault = self._write_fake_skills_vault(tmp)
+            legacy = Path(tmp) / "legacy-alpha"
+            legacy.mkdir()
+            codex_skills = home / ".codex" / "skills"
+            codex_skills.mkdir(parents=True)
+            os.symlink(legacy, codex_skills / "alpha-skill", target_is_directory=True)
+            env = {**os.environ, "HOME": str(home), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+
+            proc = subprocess.run(
+                [str(AGENT), "code", "skills", "install", "--repo", str(vault), "--client", "codex", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            alpha_resolved = (codex_skills / "alpha-skill").resolve()
+            alpha_target = (vault / "skills" / "alpha-skill").resolve()
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(alpha_resolved, alpha_target)
+        statuses = {row["status"] for row in json.loads(proc.stdout)["results"]}
+        self.assertIn("relinked", statuses)
+
+    def test_auth_preflight_detects_poisoned_anthropic_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self._write_fake_claude(tmp)
+            env = {
+                **os.environ,
+                "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state"),
+                "CLAUDE_BIN": str(fake),
+                "FAKE_CLAUDE_LOG": str(Path(tmp) / "fake.log"),
+                "ANTHROPIC_API_KEY": "invalid-test-key",
+            }
+            proc = subprocess.run(
+                [str(AGENT), "code", "auth", "preflight", "--to", "claude", "--refresh", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(proc.returncode, 1)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["status"], "env_misconfigured")
+        self.assertEqual(payload["poisoned_env"], ["ANTHROPIC_API_KEY"])
+        self.assertNotIn("invalid-test-key", proc.stdout)
 
     def test_hooks_install_is_idempotent_for_codex_and_claude(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

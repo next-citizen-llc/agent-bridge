@@ -40,6 +40,12 @@ def emit_event(
     for field in META_FIELDS:
         if field in event_meta:
             record[field] = event_meta[field]
+    traceparent = os.environ.get("AGENT_BRIDGE_TRACEPARENT")
+    if traceparent:
+        record["traceparent"] = traceparent
+    tracestate = os.environ.get("AGENT_BRIDGE_TRACESTATE") or os.environ.get("TRACESTATE")
+    if tracestate:
+        record["tracestate"] = tracestate
     path = events_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:

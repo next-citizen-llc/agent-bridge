@@ -30,6 +30,18 @@ import sys
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from .coord import (
+    capability_card,
+    capability_cards,
+    coord_cmd,
+    evaluate_policy,
+    explain_incompatibility,
+    export_envelopes,
+    format_doctor,
+    record_run_task,
+    run_doctor,
+    set_trace_context,
+)
 from .correlation import add_meta_args, child_turn_meta, ensure_run_meta, extract_meta, format_meta, iso_now, safe_fragment, utc_stamp
 from .findings import (
     create_finding,
@@ -39,6 +51,26 @@ from .findings import (
     list_verdicts,
     read_finding,
     record_verdict,
+)
+from .optimization import (
+    DEFAULT_CACHE_TTL_SECONDS,
+    build_scorecard,
+    cache_key,
+    cache_lookup,
+    cache_store,
+    cacheability_report,
+    call_openai_gateway,
+    choose_route,
+    compress_context,
+    exact_cache_path,
+    format_gateway_status,
+    format_scorecard,
+    gateway_profile,
+    gateway_status_rows,
+    load_usage,
+    parse_usage_metadata,
+    tool_cache_path,
+    write_usage,
 )
 from .trace import emit_event, events_path, format_events, load_events
 from .workflow import (
@@ -103,6 +135,7 @@ class AgentRunResult:
     return_code: int
     output: str
     transcript: Path | None = None
+    usage: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -599,8 +632,8 @@ def command_for_agent(
     budget_usd: str,
     media_dirs: list[Path] | None = None,
 ) -> list[str]:
-    command = resolve_command(agent)
     adapter = agent.get("adapter")
+    command = "openai-compatible-gateway" if adapter == "openai_gateway" else resolve_command(agent)
     media_dirs = media_dirs or []
     if adapter == "claude_code":
         permission_mode = "acceptEdits" if mode == "code" else "auto"
@@ -651,6 +684,19 @@ def command_for_agent(
             "media_dirs": os.pathsep.join(str(path) for path in media_dirs),
         }
         return [command, *fill_template([str(part) for part in templates], values)]
+    if adapter == "openai_gateway":
+        profile = gateway_profile(agent)
+        if not profile:
+            raise BridgeError(f"agent {agent['id']} adapter=openai_gateway requires a gateway profile")
+        return [
+            "openai-compatible-gateway",
+            "--base-url",
+            profile["base_url"],
+            "--model",
+            profile["model_alias"],
+            "--budget-tag",
+            profile["budget_tag"],
+        ]
     raise BridgeError(f"agent {agent['id']} has unsupported adapter {adapter!r}")
 
 
@@ -675,6 +721,105 @@ def write_header(
         handle.write("\n\n=== Agent response ===\n")
 
 
+def _append_usage_record(
+    *,
+    run_id: str | None,
+    command: str,
+    record: dict[str, Any],
+    budget_usd: str | None = None,
+) -> None:
+    if not run_id:
+        return
+    try:
+        existing = load_usage(run_id)
+        records = list(existing.get("actual", {}).get("records") or [])
+        projected = existing.get("projected") or {}
+        warnings = list(existing.get("warnings") or [])
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        records = []
+        projected = {}
+        warnings = []
+    records.append(record)
+    budget_value = None
+    if budget_usd not in {None, ""}:
+        try:
+            budget_value = float(str(budget_usd))
+        except ValueError:
+            budget_value = None
+    write_usage(
+        str(run_id),
+        build_scorecard(
+            run_id=str(run_id),
+            command=command,
+            projected=projected,
+            records=records,
+            budget_usd=budget_value,
+            warnings=warnings,
+        ),
+    )
+
+
+def _dispatch_metadata(
+    *,
+    agent: dict[str, Any],
+    prompt: str,
+    scope: str,
+    route_policy: str,
+) -> dict[str, Any]:
+    profile = gateway_profile(agent)
+    cache_report = cacheability_report(
+        prefix=scope,
+        task=prompt,
+        provider=(profile or {}).get("provider", agent.get("id", "")),
+        minimum_tokens=int(agent.get("cache_min_tokens", 1024)),
+        cache_hint=str(agent.get("cache_hint", "auto")),
+    )
+    route = choose_route(policy=route_policy, prompt=prompt, cache_status="miss")
+    return {
+        "gateway": profile,
+        "cacheability": cache_report,
+        "route": route,
+    }
+
+
+def _usage_record(
+    *,
+    agent: dict[str, Any],
+    mode: str,
+    dry_run: bool,
+    prompt: str,
+    scope: str,
+    metadata: dict[str, Any],
+    provider_usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    provider_usage = provider_usage or {}
+    gateway = metadata.get("gateway") or {}
+    compression = metadata.get("compression") or {}
+    input_tokens = provider_usage.get("input_tokens")
+    output_tokens = provider_usage.get("output_tokens")
+    if input_tokens is None:
+        input_tokens = None if not dry_run else cacheability_report(prefix=scope, task=prompt).get("prefix_tokens_estimate", 0) + cacheability_report(prefix=scope, task=prompt).get("task_tokens_estimate", 0)
+    return {
+        "target": agent.get("id"),
+        "mode": mode,
+        "dry_run": dry_run,
+        "provider": gateway.get("provider") or agent.get("id"),
+        "model": gateway.get("model_alias") or agent.get("model") or agent.get("id"),
+        "gateway": gateway.get("base_url") if gateway else None,
+        "budget_tag": gateway.get("budget_tag") if gateway else "",
+        "route": (metadata.get("route") or {}).get("route"),
+        "route_reason": (metadata.get("route") or {}).get("reason"),
+        "cache_status": "miss",
+        "cached_tokens": provider_usage.get("cached_tokens"),
+        "cache_creation_tokens": provider_usage.get("cache_creation_tokens"),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "compression_saved_tokens": compression.get("saved_tokens", 0),
+        "prompt_prefix_fingerprint": (metadata.get("cacheability") or {}).get("prefix_fingerprint"),
+        "task_fingerprint": (metadata.get("cacheability") or {}).get("task_fingerprint"),
+    }
+
+
 def _invoke_target_once(
     agent: dict[str, Any],
     *,
@@ -685,9 +830,11 @@ def _invoke_target_once(
     dry_run: bool,
     meta: dict[str, Any] | None = None,
     media_dirs: list[Path] | None = None,
+    route_policy: str = "standard",
 ) -> AgentRunResult:
     meta = meta or {}
     scope = build_scope(source, agent, mode, meta)
+    dispatch_meta = _dispatch_metadata(agent=agent, prompt=prompt, scope=scope, route_policy=route_policy)
     cmd = command_for_agent(
         agent,
         source=source,
@@ -701,10 +848,44 @@ def _invoke_target_once(
         "agent.dispatched",
         run_id=meta.get("run_id"),
         meta=meta,
-        data={"target": agent["id"], "mode": mode, "dry_run": dry_run, "project_dir": str(PROJECT_DIR)},
+        data={
+            "target": agent["id"],
+            "mode": mode,
+            "dry_run": dry_run,
+            "project_dir": str(PROJECT_DIR),
+            "gateway": dispatch_meta.get("gateway") or {},
+            "route": dispatch_meta.get("route"),
+            "cacheability": dispatch_meta.get("cacheability"),
+        },
     )
     if dry_run:
         print(f"[dry-run] {agent['id']}: {shlex.join(cmd)}")
+        route = dispatch_meta["route"]
+        cache_report = dispatch_meta["cacheability"]
+        gateway = dispatch_meta["gateway"]
+        gateway_text = f"{gateway['base_url']} model={gateway['model_alias']} budget_tag={gateway['budget_tag']}" if gateway else "direct"
+        print(f"[dry-run] {agent['id']} gateway: {gateway_text}")
+        print(f"[dry-run] {agent['id']} route: {route['route']} ({route['reason']})")
+        print(
+            "[dry-run] "
+            f"{agent['id']} prompt_cache: prefix={cache_report['prefix_fingerprint']} "
+            f"task={cache_report['task_fingerprint']} "
+            f"prefix_tokens~{cache_report['prefix_tokens_estimate']} "
+            f"{'cacheable' if cache_report['likely_provider_cacheable'] else 'below-minimum'}"
+        )
+        _append_usage_record(
+            run_id=meta.get("run_id"),
+            command="bridge",
+            budget_usd=budget_usd,
+            record=_usage_record(
+                agent=agent,
+                mode=mode,
+                dry_run=True,
+                prompt=prompt,
+                scope=scope,
+                metadata=dispatch_meta,
+            ),
+        )
         emit_event(
             "agent.completed",
             run_id=meta.get("run_id"),
@@ -712,6 +893,48 @@ def _invoke_target_once(
             data={"target": agent["id"], "mode": mode, "return_code": 0, "dry_run": True},
         )
         return AgentRunResult(return_code=0, output="")
+
+    if agent.get("adapter") == "openai_gateway":
+        profile = dispatch_meta.get("gateway")
+        if not profile:
+            raise BridgeError(f"agent {agent['id']} adapter=openai_gateway requires a gateway profile")
+        TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        prefix = safe_fragment(meta.get("run_id", agent["id"]))
+        turn = safe_fragment(meta.get("turn_id", utc_stamp()))
+        transcript = TRANSCRIPT_DIR / f"{prefix}_{turn}_{agent['id']}_{utc_stamp()}.txt"
+        write_header(transcript, source=source, target=agent["id"], mode=mode, prompt=prompt, cmd=cmd, meta=meta)
+        try:
+            gateway_result = call_openai_gateway(profile=profile, prompt=prompt, system_prompt=scope)
+            output = str(gateway_result.get("output", ""))
+            transcript.write_text(transcript.read_text(encoding="utf-8") + output + "\n", encoding="utf-8")
+            print(output)
+            usage_record = _usage_record(
+                agent=agent,
+                mode=mode,
+                dry_run=False,
+                prompt=prompt,
+                scope=scope,
+                metadata=dispatch_meta,
+                provider_usage=gateway_result.get("usage"),
+            )
+            _append_usage_record(run_id=meta.get("run_id"), command="bridge", budget_usd=budget_usd, record=usage_record)
+            emit_event(
+                "agent.completed",
+                run_id=meta.get("run_id"),
+                meta=meta,
+                data={"target": agent["id"], "mode": mode, "return_code": 0, "dry_run": False, "transcript": str(transcript), "usage": usage_record},
+            )
+            return AgentRunResult(return_code=0, output=output, transcript=transcript, usage=usage_record)
+        except RuntimeError as exc:
+            output = str(exc)
+            transcript.write_text(transcript.read_text(encoding="utf-8") + output + "\n", encoding="utf-8")
+            emit_event(
+                "agent.completed",
+                run_id=meta.get("run_id"),
+                meta=meta,
+                data={"target": agent["id"], "mode": mode, "return_code": 1, "dry_run": False, "transcript": str(transcript), "error": output},
+            )
+            return AgentRunResult(return_code=1, output=output, transcript=transcript)
 
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     prefix = safe_fragment(meta.get("run_id", agent["id"]))
@@ -736,14 +959,35 @@ def _invoke_target_once(
             transcript_handle.write(line)
             log_handle.write(line)
         rc = process.wait()
+    usage_record = _usage_record(
+        agent=agent,
+        mode=mode,
+        dry_run=False,
+        prompt=prompt,
+        scope=scope,
+        metadata=dispatch_meta,
+        provider_usage=parse_usage_metadata(_maybe_json("".join(output))),
+    )
+    _append_usage_record(run_id=meta.get("run_id"), command="bridge", budget_usd=budget_usd, record=usage_record)
     emit_event(
         "agent.completed",
         run_id=meta.get("run_id"),
         meta=meta,
-        data={"target": agent["id"], "mode": mode, "return_code": rc, "dry_run": False, "transcript": str(transcript)},
+        data={"target": agent["id"], "mode": mode, "return_code": rc, "dry_run": False, "transcript": str(transcript), "usage": usage_record},
     )
     print(f"\n[transcript] {transcript}", file=sys.stderr)
-    return AgentRunResult(return_code=rc, output="".join(output), transcript=transcript)
+    return AgentRunResult(return_code=rc, output="".join(output), transcript=transcript, usage=usage_record)
+
+
+def _maybe_json(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    if not stripped or not stripped.startswith("{"):
+        return None
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def invoke_target(
@@ -758,6 +1002,7 @@ def invoke_target(
     media_dirs: list[Path] | None = None,
     budget_auto: bool = True,
     max_auto_budget_usd: str = DEFAULT_MAX_AUTO_BUDGET_USD,
+    route_policy: str = "standard",
 ) -> int:
     budget = calibrated_budget(agent["id"], budget_usd, enabled=budget_auto and not dry_run)
     while True:
@@ -770,6 +1015,7 @@ def invoke_target(
             dry_run=dry_run,
             meta=meta,
             media_dirs=media_dirs,
+            route_policy=route_policy,
         )
         if result.return_code == 0:
             if budget_auto and not dry_run:
@@ -824,6 +1070,12 @@ def parse_bridge_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--list", action="store_true", help="List configured agents and exit")
     parser.add_argument("--dry-run", action="store_true", help="Print target commands without invoking agents")
+    parser.add_argument(
+        "--route-policy",
+        choices=["off", "no-route", "cache-first", "cheap-classifier", "standard", "premium"],
+        default=os.environ.get("AGENT_BRIDGE_ROUTE_POLICY", "standard"),
+        help="Optional token/spend routing policy for trace and dry-run explanation.",
+    )
     add_meta_args(parser)
     return parser.parse_args(argv)
 
@@ -853,12 +1105,23 @@ def bridge(argv: list[str]) -> int:
 
     targets = resolve_agent_ids(args.targets, agents)
     base_meta = ensure_run_meta(extract_meta(args))
+    policy_rc = _enforce_dispatch_policy("bridge", source=source, mode=mode, meta=base_meta)
+    if policy_rc is not None:
+        return policy_rc
+    set_trace_context(base_meta)
     emit_event(
         "run.created",
         run_id=base_meta.get("run_id"),
         meta=base_meta,
         data={"command": "bridge", "source": source, "mode": mode, "targets": targets, "dry_run": args.dry_run},
     )
+    record_run_task("created", meta=base_meta, command="bridge", data={"targets": targets, "mode": mode})
+    if args.dry_run:
+        media_suffixes = sorted({path.suffix for path in discover_prompt_heic_inputs(prompt, project_dir=PROJECT_DIR)})
+        for target_id in targets:
+            card = capability_card(agents[target_id], bridge_dir=BRIDGE_DIR)
+            for problem in explain_incompatibility(card, mode=mode, media_suffixes=media_suffixes, project_dir=str(PROJECT_DIR)):
+                print(f"[dry-run] incompatibility: {problem}")
     rc = 0
     for target_id in targets:
         target_meta = child_turn_meta(
@@ -878,6 +1141,7 @@ def bridge(argv: list[str]) -> int:
             media_dirs=media.media_dirs,
             budget_auto=not args.no_budget_auto,
             max_auto_budget_usd=str(args.max_auto_budget_usd),
+            route_policy=args.route_policy,
         )
         if target_rc != 0:
             rc = target_rc
@@ -887,7 +1151,34 @@ def bridge(argv: list[str]) -> int:
         meta=base_meta,
         data={"command": "bridge", "return_code": rc, "dry_run": args.dry_run},
     )
+    record_run_task("artifact_attached", meta=base_meta, command="bridge", artifact={"path": str(events_path()), "kind": "trace"})
+    record_run_task("completed" if rc == 0 else "failed", meta=base_meta, command="bridge", data={"return_code": rc})
     return rc
+
+
+def _enforce_dispatch_policy(action: str, *, source: str, mode: str, meta: dict[str, Any]) -> int | None:
+    """Return an exit code when local trust policy blocks a dispatch, else None."""
+    decision = evaluate_policy(
+        {
+            "client": source,
+            "machine": _harness_machine_id(),
+            "repo": str(PROJECT_DIR),
+            "mode": mode,
+            "action": action,
+            "run_id": meta.get("run_id"),
+        }
+    )
+    if decision["decision"] == "deny":
+        print(f"[agent-bridge] policy denied {action} dispatch: {decision['reason']}", file=sys.stderr)
+        return 3
+    if decision["decision"] == "require_approval" and os.environ.get("AGENT_BRIDGE_APPROVED") != "1":
+        print(
+            f"[agent-bridge] policy requires approval for {action} dispatch: {decision['reason']}. "
+            "Re-run with AGENT_BRIDGE_APPROVED=1 after operator review.",
+            file=sys.stderr,
+        )
+        return 3
+    return None
 
 
 def _json_print(value: Any) -> None:
@@ -1049,6 +1340,10 @@ def register_harness(client: str, *, root: str | None = None, status: str = "act
         "shared_bridge_dir": str(bridge_dir),
         "registry_file": str(path),
     }
+    try:
+        record["capabilities"] = capability_cards(load_config(DEFAULT_CONFIG), bridge_dir=BRIDGE_DIR)
+    except (BridgeError, OSError, json.JSONDecodeError):
+        record["capabilities"] = []
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(path)
@@ -1436,6 +1731,60 @@ def install_shared_skill(root: str | None = None, *, link_client: str = "all") -
     }
 
 
+def check_shared_skill(root: str | None = None, *, link_client: str = "all") -> dict[str, Any]:
+    """Drift checks for the installed shared skill: text freshness plus symlink health."""
+    checks: list[dict[str, Any]] = []
+    bridge_dir = shared_bridge_dir(root, create=False, required=False)
+    if bridge_dir is None or not bridge_dir.exists():
+        checks.append({"check": "shared_bridge_dir", "status": "fail", "detail": "no shared Agent-Bridge dir found; run `agent code harness install-skill`"})
+        return {"ok": False, "shared_bridge_dir": str(bridge_dir) if bridge_dir else "", "checks": checks}
+    skill_path = bridge_dir / "SKILL.md"
+    if not skill_path.exists():
+        checks.append({"check": "skill_installed", "status": "fail", "detail": f"missing {skill_path}"})
+    elif skill_path.read_text(encoding="utf-8") != render_agent_bridge_skill():
+        checks.append({"check": "skill_fresh", "status": "fail", "detail": f"{skill_path} drifted from generated text; rerun `agent code harness install-skill`"})
+    else:
+        checks.append({"check": "skill_fresh", "status": "ok", "detail": str(skill_path)})
+    for link in _skill_link_paths(link_client):
+        name = f"skill_link:{link.parent.parent.name}"
+        if not link.exists() and not link.is_symlink():
+            checks.append({"check": name, "status": "skip", "detail": f"{link} not present"})
+        elif not link.is_symlink():
+            checks.append({"check": name, "status": "fail", "detail": f"{link} exists but is not a symlink"})
+        else:
+            try:
+                ok = link.exists() and link.resolve() == bridge_dir.resolve()
+            except OSError:
+                ok = False
+            detail = f"{link} -> {link.resolve() if link.exists() else 'broken'}"
+            checks.append({"check": name, "status": "ok" if ok else "fail", "detail": detail})
+    ok = all(row["status"] != "fail" for row in checks)
+    return {"ok": ok, "shared_bridge_dir": str(bridge_dir), "checks": checks}
+
+
+def format_shared_skill_check(result: dict[str, Any]) -> str:
+    lines = [f"Shared skill check: {'ok' if result['ok'] else 'drift detected'}"]
+    for row in result["checks"]:
+        lines.append(f"[{row['status']:>4}] {row['check']}: {row['detail']}")
+    return "\n".join(lines) + "\n"
+
+
+def doctor_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code doctor", description="Check the local harness install for drift and misconfiguration.")
+    parser.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    shared_root = resolve_shared_skills_root(args.root, required=False, require_bridge_dir=True)
+    report = run_doctor(
+        skill_text=render_agent_bridge_skill(),
+        shared_root=shared_root,
+        bridge_dir=BRIDGE_DIR,
+        config_loader=lambda: load_config(DEFAULT_CONFIG),
+    )
+    _json_print(report) if args.json else print(format_doctor(report), end="")
+    return 0 if report["ok"] else 1
+
+
 def format_shared_skill_install(result: dict[str, Any]) -> str:
     lines = [
         f"Shared Agent Bridge: {result['shared_bridge_dir']}",
@@ -1594,6 +1943,7 @@ def harness_cmd(argv: list[str]) -> int:
     install = sub.add_parser("install-skill", help="Install the shared Agent Bridge skill package.")
     install.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
     install.add_argument("--link-client", choices=["none", "codex", "claude", "agents", "all"], default="all")
+    install.add_argument("--check", action="store_true", help="Report skill/symlink drift without writing anything.")
     install.add_argument("--json", action="store_true")
 
     register = sub.add_parser("register", help="Write a shared registry heartbeat for this harness.")
@@ -1609,6 +1959,10 @@ def harness_cmd(argv: list[str]) -> int:
 
     args = parser.parse_args(argv)
     if args.cmd == "install-skill":
+        if args.check:
+            result = check_shared_skill(args.root, link_client=args.link_client)
+            _json_print(result) if args.json else print(format_shared_skill_check(result), end="")
+            return 0 if result["ok"] else 1
         result = install_shared_skill(args.root, link_client=args.link_client)
         _json_print(result) if args.json else print(format_shared_skill_install(result), end="")
         return 0
@@ -1626,7 +1980,11 @@ def trace_cmd(argv: list[str]) -> int:
     parser.add_argument("--run-id")
     parser.add_argument("--type", dest="event_type")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--envelope", action="store_true", help="Emit portable event envelopes with traceparent context (JSON)")
     args = parser.parse_args(argv)
+    if args.envelope:
+        _json_print(export_envelopes(run_id=args.run_id, event_type=args.event_type))
+        return 0
     rows = load_events(run_id=args.run_id, event_type=args.event_type)
     if args.json:
         _json_print(rows)
@@ -1720,6 +2078,172 @@ def verdicts_cmd(argv: list[str]) -> int:
     return 0
 
 
+def gateway_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code gateway", description="Inspect or exercise optional LLM gateway routing.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    status = sub.add_parser("status", help="Show direct vs gateway-routed agent profiles.")
+    status.add_argument("--config", default=str(DEFAULT_CONFIG))
+    status.add_argument("--json", action="store_true")
+
+    chat = sub.add_parser("chat", help="Exercise an OpenAI-compatible gateway profile.")
+    chat.add_argument("--config", default=str(DEFAULT_CONFIG))
+    chat.add_argument("--to", required=True)
+    chat.add_argument("--prompt", required=True)
+    chat.add_argument("--system", default="You are a concise local test adapter.")
+    chat.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    agents = agent_map(load_config(Path(args.config)))
+    if args.cmd == "status":
+        rows = gateway_status_rows(agents)
+        _json_print(rows) if args.json else print(format_gateway_status(rows), end="")
+        return 0
+
+    if args.to not in agents:
+        raise BridgeError(f"unknown gateway target {args.to!r}")
+    profile = gateway_profile(agents[args.to])
+    if not profile:
+        raise BridgeError(f"agent {args.to!r} has no gateway profile")
+    result = call_openai_gateway(profile=profile, prompt=args.prompt, system_prompt=args.system)
+    _json_print(result) if args.json else print(result.get("output", ""))
+    return 0
+
+
+def usage_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code usage", description="Inspect Agent Bridge run-level usage scorecards.")
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    payload = load_usage(args.run_id)
+    _json_print(payload) if args.json else print(format_scorecard(payload), end="")
+    return 0
+
+
+def cache_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code cache", description="Inspect deterministic exact/tool-result cache entries.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    key_parser = sub.add_parser("key", help="Compute a cache key for repeatable calls or tool results.")
+    key_parser.add_argument("--class", dest="cache_class", default="tool-result")
+    key_parser.add_argument("--model", default="")
+    key_parser.add_argument("--provider", default="")
+    key_parser.add_argument("--prefix", default="")
+    key_parser.add_argument("--task", default="")
+    key_parser.add_argument("--tool", default="")
+    key_parser.add_argument("--tool-args", default="")
+    key_parser.add_argument("--project-dir")
+
+    put = sub.add_parser("put")
+    put.add_argument("--key", required=True)
+    put.add_argument("--value", required=True)
+    put.add_argument("--class", dest="cache_class", default="tool-result")
+    put.add_argument("--ttl-seconds", type=int, default=DEFAULT_CACHE_TTL_SECONDS)
+    put.add_argument("--semantic-text", default="")
+    put.add_argument("--tool-result", action="store_true")
+    put.add_argument("--json", action="store_true")
+
+    get = sub.add_parser("get")
+    get.add_argument("--key", required=True)
+    get.add_argument("--semantic-query")
+    get.add_argument("--semantic", action="store_true")
+    get.add_argument("--threshold", type=float, default=0.9)
+    get.add_argument("--tool-result", action="store_true")
+    get.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.cmd == "key":
+        project_dir = Path(args.project_dir).expanduser().resolve() if args.project_dir else None
+        print(
+            cache_key(
+                cache_class=args.cache_class,
+                model=args.model,
+                provider=args.provider,
+                prefix=args.prefix,
+                task=args.task,
+                project_dir=project_dir,
+                tool=args.tool,
+                tool_args=args.tool_args,
+            )
+        )
+        return 0
+    path = tool_cache_path() if getattr(args, "tool_result", False) else exact_cache_path()
+    if args.cmd == "put":
+        value: Any
+        try:
+            value = json.loads(args.value)
+        except json.JSONDecodeError:
+            value = args.value
+        entry = cache_store(
+            args.key,
+            value,
+            cache_class=args.cache_class,
+            ttl_seconds=args.ttl_seconds,
+            semantic_text=args.semantic_text,
+            path=path,
+        )
+        _json_print(entry) if args.json else print(args.key)
+        return 0
+    result = cache_lookup(
+        args.key,
+        semantic_query=args.semantic_query,
+        semantic_enabled=args.semantic,
+        semantic_threshold=args.threshold,
+        path=path,
+    )
+    _json_print(result) if args.json else print(result.get("status", "miss"))
+    return 0
+
+
+def optimize_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code optimize", description="Dry-run token optimization helpers.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    route = sub.add_parser("route")
+    route.add_argument("--policy", default=os.environ.get("AGENT_BRIDGE_ROUTE_POLICY", "standard"))
+    route.add_argument("--prompt", required=True)
+    route.add_argument("--cache-status", default="miss")
+    route.add_argument("--json", action="store_true")
+
+    cacheable = sub.add_parser("cacheability")
+    cacheable.add_argument("--prefix", required=True)
+    cacheable.add_argument("--task", required=True)
+    cacheable.add_argument("--provider", default="")
+    cacheable.add_argument("--minimum-tokens", type=int, default=1024)
+    cacheable.add_argument("--json", action="store_true")
+
+    compress = sub.add_parser("compress")
+    compress.add_argument("--mode", choices=["off", "trim", "summarize", "external"], default="off")
+    compress.add_argument("--max-chars", type=int, default=8000)
+    compress.add_argument("--command")
+    compress.add_argument("--text")
+    compress.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.cmd == "route":
+        result = choose_route(policy=args.policy, prompt=args.prompt, cache_status=args.cache_status)
+        _json_print(result) if args.json else print(f"{result['route']}: {result['reason']}")
+        return 0
+    if args.cmd == "cacheability":
+        result = cacheability_report(
+            prefix=args.prefix,
+            task=args.task,
+            provider=args.provider,
+            minimum_tokens=args.minimum_tokens,
+        )
+        _json_print(result) if args.json else print(f"{result['prefix_fingerprint']}\t{result['reason']}")
+        return 0
+    text = args.text if args.text is not None else (sys.stdin.read() if not sys.stdin.isatty() else "")
+    result = compress_context(text, mode=args.mode, max_chars=args.max_chars, external_command=args.command)
+    if args.json:
+        _json_print(result)
+    else:
+        print(result["compressed"], end="" if result["compressed"].endswith("\n") else "\n")
+        if result.get("warning"):
+            print(f"warning: {result['warning']}", file=sys.stderr)
+    return 0
+
+
 def workflow_cmd(argv: list[str]) -> int:
     global PROJECT_DIR
     parser = argparse.ArgumentParser(prog="agent workflow", description="Run portable workflows across configured agent engines.")
@@ -1744,6 +2268,11 @@ def workflow_cmd(argv: list[str]) -> int:
     run.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to bridge agent config JSON")
     run.add_argument("--model", help="Optional engine model override.")
     run.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_BUDGET_USD", "0.50"))
+    run.add_argument("--cache-mode", choices=["off", "exact", "semantic"], default=os.environ.get("AGENT_BRIDGE_WORKFLOW_CACHE_MODE", "off"))
+    run.add_argument("--semantic-cache-threshold", type=float, default=float(os.environ.get("AGENT_BRIDGE_SEMANTIC_CACHE_THRESHOLD", "0.9")))
+    run.add_argument("--compress", choices=["off", "trim", "summarize", "external"], default=os.environ.get("AGENT_BRIDGE_CONTEXT_COMPRESSOR", "off"))
+    run.add_argument("--compress-max-chars", type=int, default=int(os.environ.get("AGENT_BRIDGE_COMPRESS_MAX_CHARS", "12000")))
+    run.add_argument("--compress-command", default=os.environ.get("AGENT_BRIDGE_COMPRESS_COMMAND"))
     run.add_argument("--dry-run", action="store_true", help="Plan the workflow dispatch without invoking a model.")
     add_meta_args(run)
 
@@ -1802,20 +2331,35 @@ def workflow_cmd(argv: list[str]) -> int:
         return 0
 
     config = load_config(Path(args.config))
-    result = run_workflow(
-        workflow_id=args.workflow_id,
-        question=question,
-        tier=args.tier,
-        engine=args.engine,
-        source=args.source,
-        agents=agent_map(config),
-        project_dir=PROJECT_DIR,
-        concurrency=args.concurrency,
-        fmt=args.format,
-        model=args.model,
-        budget_usd=str(args.budget_usd),
-        meta=meta,
-    )
+    set_trace_context(meta)
+    record_run_task("created", meta=meta, command="workflow", data={"workflow_id": args.workflow_id, "tier": args.tier})
+    try:
+        result = run_workflow(
+            workflow_id=args.workflow_id,
+            question=question,
+            tier=args.tier,
+            engine=args.engine,
+            source=args.source,
+            agents=agent_map(config),
+            project_dir=PROJECT_DIR,
+            concurrency=args.concurrency,
+            fmt=args.format,
+            model=args.model,
+            budget_usd=str(args.budget_usd),
+            cache_mode=args.cache_mode,
+            semantic_cache_threshold=args.semantic_cache_threshold,
+            compression_mode=args.compress,
+            compression_max_chars=args.compress_max_chars,
+            compression_command=args.compress_command,
+            meta=meta,
+        )
+    except Exception:
+        record_run_task("failed", meta=meta, command="workflow")
+        raise
+    artifact_dir = result.get("artifact_dir")
+    if artifact_dir:
+        record_run_task("artifact_attached", meta=meta, command="workflow", artifact={"path": str(artifact_dir), "kind": "dir"})
+    record_run_task("completed", meta=meta, command="workflow", data={"status": result.get("status")})
     if args.format == "json":
         _json_print(result)
     elif args.format == "text":
@@ -1865,6 +2409,12 @@ def parse_loop_args(argv: list[str]) -> argparse.Namespace:
         choices=["auto", "full", "adversarial-only"],
         default=os.environ.get("AGENT_BRIDGE_SPAWN_POLICY", "auto"),
         help="Dispatch policy. auto gates full loops; adversarial-only dispatches one review agent.",
+    )
+    parser.add_argument(
+        "--route-policy",
+        choices=["off", "no-route", "cache-first", "cheap-classifier", "standard", "premium"],
+        default=os.environ.get("AGENT_BRIDGE_ROUTE_POLICY", "standard"),
+        help="Optional token/spend route policy for loop phases.",
     )
     parser.add_argument("--prompt", help="Loop task prompt. If omitted in non-interactive mode, stdin is used.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned dispatches without invoking agents")
@@ -1924,6 +2474,11 @@ def loop(argv: list[str]) -> int:
 
     base_meta = ensure_run_meta(extract_meta(args))
     base_meta.setdefault("loop_id", base_meta.get("run_id", "run").replace("run_", "loop_", 1))
+    policy_rc = _enforce_dispatch_policy("loop", source=args.source, mode="code", meta=base_meta)
+    if policy_rc is not None:
+        return policy_rc
+    set_trace_context(base_meta)
+    record_run_task("created", meta=base_meta, command="loop", data={"spawn_policy": args.spawn_policy})
     emit_event(
         "run.created",
         run_id=base_meta.get("run_id"),
@@ -1988,6 +2543,7 @@ def loop(argv: list[str]) -> int:
                 media_dirs=media.media_dirs,
                 budget_auto=not args.no_budget_auto,
                 max_auto_budget_usd=str(args.max_auto_budget_usd),
+                route_policy=args.route_policy,
             )
             parent_id = str(turn_meta["turn_id"])
             if target_rc != 0:
@@ -2002,6 +2558,8 @@ def loop(argv: list[str]) -> int:
         meta=base_meta,
         data={"command": "loop", "return_code": rc, "dry_run": args.dry_run, "events": str(events_path())},
     )
+    record_run_task("artifact_attached", meta=base_meta, command="loop", artifact={"path": str(events_path()), "kind": "trace"})
+    record_run_task("completed" if rc == 0 else "failed", meta=base_meta, command="loop", data={"return_code": rc})
     print(f"run_id: {base_meta['run_id']}")
     print(f"loop_id: {base_meta['loop_id']}")
     print(f"dispatch_decision: {decision.mode}")
@@ -2026,12 +2584,24 @@ def main(argv: list[str]) -> int:
         return findings_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "verdicts":
         return verdicts_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "gateway":
+        return gateway_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "usage":
+        return usage_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "cache":
+        return cache_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "optimize":
+        return optimize_cmd(argv[2:])
     if len(argv) >= 3 and argv[0] == "code" and argv[1] == "hook" and argv[2] == "session-start":
         return hook_session_start(argv[3:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "hooks":
         return hooks_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "harness":
         return harness_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "doctor":
+        return doctor_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] in {"capabilities", "tasks", "transport", "policy", "eval", "daemon"}:
+        return coord_cmd(argv[1], argv[2:])
     if len(argv) >= 1 and argv[0] == "bridge":
         return bridge(argv[1:])
     print("usage: agent code bridge [options]", file=sys.stderr)
@@ -2040,9 +2610,20 @@ def main(argv: list[str]) -> int:
     print("       agent code trace [options]", file=sys.stderr)
     print("       agent code findings <create|list|read> [options]", file=sys.stderr)
     print("       agent code verdicts <record|list> [options]", file=sys.stderr)
+    print("       agent code gateway <status|chat> [options]", file=sys.stderr)
+    print("       agent code usage --run-id <id> [options]", file=sys.stderr)
+    print("       agent code cache <key|put|get> [options]", file=sys.stderr)
+    print("       agent code optimize <route|cacheability|compress> [options]", file=sys.stderr)
     print("       agent code hook session-start [options]", file=sys.stderr)
     print("       agent code hooks <install|status> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
+    print("       agent code doctor [options]", file=sys.stderr)
+    print("       agent code capabilities [options]", file=sys.stderr)
+    print("       agent code tasks <create|claim|update|request-input|cancel|resume|attach|inspect|list> [options]", file=sys.stderr)
+    print("       agent code transport <send|receive|ack|status|smoke> [options]", file=sys.stderr)
+    print("       agent code policy <check|show|sign|verify> [options]", file=sys.stderr)
+    print("       agent code eval [options]", file=sys.stderr)
+    print("       agent code daemon status", file=sys.stderr)
     print("       agent workflow <list|show|run|inspect> [options]", file=sys.stderr)
     print("       agent bridge [options]", file=sys.stderr)
     return 2

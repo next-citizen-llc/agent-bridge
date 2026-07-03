@@ -26,6 +26,16 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .correlation import ensure_run_meta, format_meta, safe_fragment
+from .optimization import (
+    build_scorecard,
+    cache_key,
+    cache_lookup,
+    cache_store,
+    compress_context,
+    estimate_tokens,
+    parse_usage_metadata,
+    write_usage,
+)
 from .trace import emit_event, events_path, state_dir
 
 
@@ -688,6 +698,91 @@ class FakeEngineAdapter(EngineAdapter):
         raise WorkflowError(f"fake adapter has no response for {label!r}")
 
 
+class OptimizingEngineAdapter(EngineAdapter):
+    """Optional cache and usage recorder around a workflow engine adapter."""
+
+    def __init__(
+        self,
+        inner: EngineAdapter,
+        *,
+        run_id: str,
+        engine: str,
+        project_dir: Path,
+        cache_mode: str = "off",
+        semantic_threshold: float = 0.9,
+    ) -> None:
+        self.inner = inner
+        self.run_id = run_id
+        self.engine = engine
+        self.project_dir = project_dir
+        self.cache_mode = cache_mode
+        self.semantic_threshold = semantic_threshold
+        self.records: list[dict[str, Any]] = []
+
+    def call(self, call: ModelCall) -> dict[str, Any]:
+        key = cache_key(
+            cache_class="workflow",
+            model=self.engine,
+            provider=self.engine,
+            prefix=call.phase,
+            task=call.prompt,
+            project_dir=self.project_dir,
+            tool="workflow-model-call",
+            tool_args={"label": call.label, "schema": call.schema},
+        )
+        if self.cache_mode in {"exact", "semantic"}:
+            hit = cache_lookup(
+                key,
+                semantic_query=call.prompt,
+                semantic_enabled=self.cache_mode == "semantic",
+                semantic_threshold=self.semantic_threshold,
+            )
+            if hit["status"] in {"hit", "semantic_hit"}:
+                entry = hit["entry"]
+                self.records.append(self._record(call, cache_status=hit["status"], cached=True, usage={}))
+                return dict(entry.get("value") or {})
+
+        response = self.inner.call(call)
+        usage = _response_usage(response)
+        self.records.append(self._record(call, cache_status="miss", cached=False, usage=usage))
+        if self.cache_mode in {"exact", "semantic"}:
+            cache_store(
+                key,
+                response,
+                cache_class="workflow",
+                semantic_text=call.prompt,
+                metadata={"run_id": self.run_id, "engine": self.engine, "phase": call.phase, "label": call.label},
+            )
+        return response
+
+    def _record(self, call: ModelCall, *, cache_status: str, cached: bool, usage: dict[str, Any]) -> dict[str, Any]:
+        estimated_input = estimate_tokens(call.prompt)
+        estimated_output = 0 if cached else None
+        return {
+            "phase": call.phase,
+            "label": call.label,
+            "cache_status": cache_status,
+            "cached": cached,
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cached_tokens": usage.get("cached_tokens") if usage else (estimated_input if cached else None),
+            "estimated_input_tokens": estimated_input,
+            "estimated_output_tokens": estimated_output,
+            "model": self.engine,
+            "provider": self.engine,
+            "route": "cache" if cached else "standard",
+        }
+
+
+def _response_usage(response: dict[str, Any]) -> dict[str, Any]:
+    for key in ("_usage", "usage"):
+        value = response.get(key)
+        if isinstance(value, dict):
+            parsed = parse_usage_metadata({"usage": value})
+            return parsed if parsed else value
+    return {}
+
+
 def create_engine_adapter(
     *,
     engine: str,
@@ -795,6 +890,11 @@ def run_workflow(
     fmt: str = "both",
     model: str | None = None,
     budget_usd: str = "0.50",
+    cache_mode: str = "off",
+    semantic_cache_threshold: float = 0.9,
+    compression_mode: str = "off",
+    compression_max_chars: int = 12000,
+    compression_command: str | None = None,
     meta: dict[str, Any] | None = None,
     adapter: EngineAdapter | None = None,
 ) -> dict[str, Any]:
@@ -815,6 +915,8 @@ def run_workflow(
     resolved_engine = resolve_engine(engine, source)
     run_dir = workflow_run_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
+    pricing = resolve_pricing(resolved_engine)
+    usage = build_usage(spec, question=question, tier=tier, engine=resolved_engine, budget_usd=budget_usd, pricing=pricing)
     manifest = {
         "workflow_id": spec["id"],
         "name": spec["name"],
@@ -826,8 +928,25 @@ def run_workflow(
         "correlation": format_meta(run_meta),
         "events": str(events_path()),
         "artifact_dir": str(run_dir),
+        "optimization": {
+            "cache_mode": cache_mode,
+            "semantic_cache_threshold": semantic_cache_threshold,
+            "compression_mode": compression_mode,
+            "compression_max_chars": compression_max_chars,
+        },
     }
     write_json(run_dir / "manifest.json", manifest)
+    write_json(run_dir / "usage.json", usage)
+    write_usage(
+        run_id,
+        build_scorecard(
+            run_id=run_id,
+            command="workflow",
+            projected=usage["projected"],
+            records=[],
+            budget_usd=float(_first_float(budget_usd)),
+        ),
+    )
     emit_event("workflow.created", run_id=run_id, meta=run_meta, data=manifest)
 
     if adapter is None:
@@ -841,24 +960,74 @@ def run_workflow(
             model=model,
             budget_usd=budget_usd,
         )
+    optimizing_adapter = OptimizingEngineAdapter(
+        adapter,
+        run_id=run_id,
+        engine=resolved_engine,
+        project_dir=project_dir,
+        cache_mode=cache_mode,
+        semantic_threshold=semantic_cache_threshold,
+    )
 
     try:
-        result = _run_deep_research_lite(spec, question, tier, adapter, run_dir, concurrency, run_meta)
+        result = _run_deep_research_lite(
+            spec,
+            question,
+            tier,
+            optimizing_adapter,
+            run_dir,
+            concurrency,
+            run_meta,
+            compression_mode=compression_mode,
+            compression_max_chars=compression_max_chars,
+            compression_command=compression_command,
+        )
     except Exception as exc:
         emit_event("workflow.failed", run_id=run_id, meta=run_meta, data={"error": str(exc)})
         raise
 
     result.update({"workflow_id": spec["id"], "run_id": run_id, "engine": resolved_engine})
+    compression_usage_records = [
+        {
+            "phase": "Fetch",
+            "label": "context-compression",
+            "cache_status": "n/a",
+            "route": "compress",
+            "compression_saved_tokens": row.get("saved_tokens", 0),
+            "input_tokens": None,
+            "output_tokens": None,
+            "provider": resolved_engine,
+            "model": resolved_engine,
+        }
+        for row in result.get("optimization", {}).get("compression", [])
+    ]
+    usage_records = [*optimizing_adapter.records, *compression_usage_records]
+    actual_usage = summarize_actual_usage(usage_records, pricing)
+    usage = build_usage(spec, question=question, tier=result.get("tier", tier), engine=resolved_engine, budget_usd=budget_usd, pricing=pricing, actual=actual_usage)
+    result["usage"] = usage
     report = format_report(result)
     report_path = run_dir / "report.md"
     result_path = run_dir / "result.json"
     report_path.write_text(report, encoding="utf-8")
     write_json(result_path, result)
+    write_json(run_dir / "usage.json", usage)
+    write_usage(
+        run_id,
+        build_scorecard(
+            run_id=run_id,
+            command="workflow",
+            projected=usage["projected"],
+            records=usage_records,
+            budget_usd=float(_first_float(budget_usd)),
+            warnings=[] if actual_usage.get("available") else ["provider token metadata unavailable; estimates only"],
+        ),
+    )
     manifest["tier"] = result.get("tier")
     manifest["artifacts"] = {
         "manifest": str(run_dir / "manifest.json"),
         "report": str(report_path),
         "result": str(result_path),
+        "usage": str(run_dir / "usage.json"),
         "events": str(events_path()),
     }
     write_json(run_dir / "manifest.json", manifest)
@@ -886,6 +1055,10 @@ def _run_deep_research_lite(
     run_dir: Path,
     concurrency: int,
     run_meta: dict[str, Any],
+    *,
+    compression_mode: str = "off",
+    compression_max_chars: int = 12000,
+    compression_command: str | None = None,
 ) -> dict[str, Any]:
     tier_tag = re.match(r"^\[(shallow|standard|deep)\]\s*", raw_question, flags=re.IGNORECASE)
     forced_tier = None
@@ -930,15 +1103,44 @@ def _run_deep_research_lite(
     fetch_jobs = _select_fetch_jobs(search_results, int(spec.get("sources_per_angle", 3)), int(cfg["fetch"]))
 
     _phase("Fetch", run_meta)
+    compression_records: list[dict[str, Any]] = []
 
     def do_fetch(job: dict[str, Any]) -> dict[str, Any]:
         source = job["source"]
         fetched = fetch_source_excerpt(str(source.get("url", "")), run_dir, int(job["index"]))
-        source_context = (
+        original_context = (
             "Runner-fetched source excerpt:\n" + fetched["excerpt"]
             if fetched["ok"] and fetched["excerpt"]
             else "Runner fetch failed: " + fetched["error"] + "\nUse native web tools if available."
         )
+        source_context = original_context
+        compression_record: dict[str, Any] | None = None
+        if compression_mode != "off":
+            compression_record = compress_context(
+                original_context,
+                mode=compression_mode,
+                max_chars=compression_max_chars,
+                external_command=compression_command,
+            )
+            source_context = compression_record["compressed"]
+            compression_path = run_dir / "compressed" / f"{int(job['index']):03d}_{safe_fragment(str(source.get('url', 'source')))}.txt"
+            compression_path.parent.mkdir(parents=True, exist_ok=True)
+            compression_path.write_text(source_context, encoding="utf-8")
+            compression_records.append(
+                {
+                    "url": source.get("url", ""),
+                    "path": str(compression_path),
+                    "mode": compression_record["mode"],
+                    "original_tokens": compression_record["original_tokens"],
+                    "compressed_tokens": compression_record["compressed_tokens"],
+                    "saved_tokens": max(0, int(compression_record["original_tokens"]) - int(compression_record["compressed_tokens"])),
+                    "ratio": compression_record["ratio"],
+                    "quality_risk": compression_record["quality_risk"],
+                    "warning": compression_record["warning"],
+                    "fallback": compression_record["fallback"],
+                    "original_path": fetched.get("path", ""),
+                }
+            )
         host = "unknown"
         try:
             from urllib.parse import urlparse
@@ -977,7 +1179,7 @@ def _run_deep_research_lite(
     all_sources = [source for source in parallel_map(fetch_jobs["jobs"], do_fetch, concurrency) if source]
     raw_claims = [claim for source in all_sources for claim in source.get("claims", [])]
     if not raw_claims:
-        return _empty_result(question, resolved_tier, all_sources, fetch_jobs)
+        return _empty_result(question, resolved_tier, all_sources, fetch_jobs, compression_records=compression_records, cache_mode=getattr(adapter, "cache_mode", "off"))
 
     _phase("Dedup", run_meta)
     claims_block = "\n".join(
@@ -1064,6 +1266,7 @@ def _run_deep_research_lite(
             "refuted": _refuted(killed),
             "sources": _source_summary(all_sources),
             "stats": _stats(resolved_tier, angles, all_sources, raw_claims, unique_claims, ranked_claims, round1, confirmed, killed, fetch_jobs),
+            "optimization": {"compression": compression_records, "cache_mode": getattr(adapter, "cache_mode", "off")},
             "completeness": {},
         }
 
@@ -1115,6 +1318,7 @@ def _run_deep_research_lite(
         "refuted": _refuted(killed),
         "sources": _source_summary(all_sources),
         "stats": _stats(resolved_tier, angles, all_sources, raw_claims, unique_claims, ranked_claims, round1, confirmed, killed, fetch_jobs),
+        "optimization": {"compression": compression_records, "cache_mode": getattr(adapter, "cache_mode", "off")},
         "completeness": {
             "coverage": critic.get("coverage"),
             "underCovered": critic.get("underCovered", []),
@@ -1264,7 +1468,15 @@ def _confirmed_block(confirmed: list[dict[str, Any]]) -> str:
     return "\n".join(rows)
 
 
-def _empty_result(question: str, tier: str, all_sources: list[dict[str, Any]], fetch_jobs: dict[str, Any]) -> dict[str, Any]:
+def _empty_result(
+    question: str,
+    tier: str,
+    all_sources: list[dict[str, Any]],
+    fetch_jobs: dict[str, Any],
+    *,
+    compression_records: list[dict[str, Any]] | None = None,
+    cache_mode: str = "off",
+) -> dict[str, Any]:
     return {
         "question": question,
         "tier": tier,
@@ -1286,6 +1498,7 @@ def _empty_result(question: str, tier: str, all_sources: list[dict[str, Any]], f
             "urlDupes": len(fetch_jobs.get("dupes", [])),
             "budgetDropped": len(fetch_jobs.get("budgetDropped", [])),
         },
+        "optimization": {"compression": compression_records or [], "cache_mode": cache_mode},
         "completeness": {},
     }
 
@@ -1324,12 +1537,30 @@ def format_report(result: dict[str, Any]) -> str:
     if open_questions:
         lines.extend(["", "## Open Questions"])
         lines.extend(f"- {question}" for question in open_questions)
+    optimization = result.get("optimization") or {}
+    compression = optimization.get("compression") or []
+    lines.extend(
+        [
+            "",
+            "## Optimization",
+            f"- Cache mode: {optimization.get('cache_mode', 'off')}",
+            f"- Compressed contexts: {len(compression)}",
+        ]
+    )
+    if compression:
+        saved = sum(int(row.get("saved_tokens") or 0) for row in compression)
+        lossy = len([row for row in compression if row.get("quality_risk") not in {"", "none"}])
+        lines.append(f"- Estimated compression savings: {saved} tokens")
+        lines.append(f"- Lossy compression records: {lossy}")
+    if result.get("usage"):
+        lines.extend(["", format_usage_block(result["usage"])])
     lines.extend(
         [
             "",
             "## Artifacts",
             f"- report.md: {workflow_run_dir(str(result.get('run_id', ''))) / 'report.md'}",
             f"- result.json: {workflow_run_dir(str(result.get('run_id', ''))) / 'result.json'}",
+            f"- usage.json: {workflow_run_dir(str(result.get('run_id', ''))) / 'usage.json'}",
             f"- events: {events_path()}",
         ]
     )

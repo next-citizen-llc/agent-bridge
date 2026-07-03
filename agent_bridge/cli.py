@@ -30,6 +30,18 @@ import sys
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from .coord import (
+    capability_card,
+    capability_cards,
+    coord_cmd,
+    evaluate_policy,
+    explain_incompatibility,
+    export_envelopes,
+    format_doctor,
+    record_run_task,
+    run_doctor,
+    set_trace_context,
+)
 from .correlation import add_meta_args, child_turn_meta, ensure_run_meta, extract_meta, format_meta, iso_now, safe_fragment, utc_stamp
 from .findings import (
     create_finding,
@@ -853,12 +865,23 @@ def bridge(argv: list[str]) -> int:
 
     targets = resolve_agent_ids(args.targets, agents)
     base_meta = ensure_run_meta(extract_meta(args))
+    policy_rc = _enforce_dispatch_policy("bridge", source=source, mode=mode, meta=base_meta)
+    if policy_rc is not None:
+        return policy_rc
+    set_trace_context(base_meta)
     emit_event(
         "run.created",
         run_id=base_meta.get("run_id"),
         meta=base_meta,
         data={"command": "bridge", "source": source, "mode": mode, "targets": targets, "dry_run": args.dry_run},
     )
+    record_run_task("created", meta=base_meta, command="bridge", data={"targets": targets, "mode": mode})
+    if args.dry_run:
+        media_suffixes = sorted({path.suffix for path in discover_prompt_heic_inputs(prompt, project_dir=PROJECT_DIR)})
+        for target_id in targets:
+            card = capability_card(agents[target_id], bridge_dir=BRIDGE_DIR)
+            for problem in explain_incompatibility(card, mode=mode, media_suffixes=media_suffixes, project_dir=str(PROJECT_DIR)):
+                print(f"[dry-run] incompatibility: {problem}")
     rc = 0
     for target_id in targets:
         target_meta = child_turn_meta(
@@ -887,7 +910,34 @@ def bridge(argv: list[str]) -> int:
         meta=base_meta,
         data={"command": "bridge", "return_code": rc, "dry_run": args.dry_run},
     )
+    record_run_task("artifact_attached", meta=base_meta, command="bridge", artifact={"path": str(events_path()), "kind": "trace"})
+    record_run_task("completed" if rc == 0 else "failed", meta=base_meta, command="bridge", data={"return_code": rc})
     return rc
+
+
+def _enforce_dispatch_policy(action: str, *, source: str, mode: str, meta: dict[str, Any]) -> int | None:
+    """Return an exit code when local trust policy blocks a dispatch, else None."""
+    decision = evaluate_policy(
+        {
+            "client": source,
+            "machine": _harness_machine_id(),
+            "repo": str(PROJECT_DIR),
+            "mode": mode,
+            "action": action,
+            "run_id": meta.get("run_id"),
+        }
+    )
+    if decision["decision"] == "deny":
+        print(f"[agent-bridge] policy denied {action} dispatch: {decision['reason']}", file=sys.stderr)
+        return 3
+    if decision["decision"] == "require_approval" and os.environ.get("AGENT_BRIDGE_APPROVED") != "1":
+        print(
+            f"[agent-bridge] policy requires approval for {action} dispatch: {decision['reason']}. "
+            "Re-run with AGENT_BRIDGE_APPROVED=1 after operator review.",
+            file=sys.stderr,
+        )
+        return 3
+    return None
 
 
 def _json_print(value: Any) -> None:
@@ -1049,6 +1099,10 @@ def register_harness(client: str, *, root: str | None = None, status: str = "act
         "shared_bridge_dir": str(bridge_dir),
         "registry_file": str(path),
     }
+    try:
+        record["capabilities"] = capability_cards(load_config(DEFAULT_CONFIG), bridge_dir=BRIDGE_DIR)
+    except (BridgeError, OSError, json.JSONDecodeError):
+        record["capabilities"] = []
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(path)
@@ -1436,6 +1490,60 @@ def install_shared_skill(root: str | None = None, *, link_client: str = "all") -
     }
 
 
+def check_shared_skill(root: str | None = None, *, link_client: str = "all") -> dict[str, Any]:
+    """Drift checks for the installed shared skill: text freshness plus symlink health."""
+    checks: list[dict[str, Any]] = []
+    bridge_dir = shared_bridge_dir(root, create=False, required=False)
+    if bridge_dir is None or not bridge_dir.exists():
+        checks.append({"check": "shared_bridge_dir", "status": "fail", "detail": "no shared Agent-Bridge dir found; run `agent code harness install-skill`"})
+        return {"ok": False, "shared_bridge_dir": str(bridge_dir) if bridge_dir else "", "checks": checks}
+    skill_path = bridge_dir / "SKILL.md"
+    if not skill_path.exists():
+        checks.append({"check": "skill_installed", "status": "fail", "detail": f"missing {skill_path}"})
+    elif skill_path.read_text(encoding="utf-8") != render_agent_bridge_skill():
+        checks.append({"check": "skill_fresh", "status": "fail", "detail": f"{skill_path} drifted from generated text; rerun `agent code harness install-skill`"})
+    else:
+        checks.append({"check": "skill_fresh", "status": "ok", "detail": str(skill_path)})
+    for link in _skill_link_paths(link_client):
+        name = f"skill_link:{link.parent.parent.name}"
+        if not link.exists() and not link.is_symlink():
+            checks.append({"check": name, "status": "skip", "detail": f"{link} not present"})
+        elif not link.is_symlink():
+            checks.append({"check": name, "status": "fail", "detail": f"{link} exists but is not a symlink"})
+        else:
+            try:
+                ok = link.exists() and link.resolve() == bridge_dir.resolve()
+            except OSError:
+                ok = False
+            detail = f"{link} -> {link.resolve() if link.exists() else 'broken'}"
+            checks.append({"check": name, "status": "ok" if ok else "fail", "detail": detail})
+    ok = all(row["status"] != "fail" for row in checks)
+    return {"ok": ok, "shared_bridge_dir": str(bridge_dir), "checks": checks}
+
+
+def format_shared_skill_check(result: dict[str, Any]) -> str:
+    lines = [f"Shared skill check: {'ok' if result['ok'] else 'drift detected'}"]
+    for row in result["checks"]:
+        lines.append(f"[{row['status']:>4}] {row['check']}: {row['detail']}")
+    return "\n".join(lines) + "\n"
+
+
+def doctor_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code doctor", description="Check the local harness install for drift and misconfiguration.")
+    parser.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    shared_root = resolve_shared_skills_root(args.root, required=False, require_bridge_dir=True)
+    report = run_doctor(
+        skill_text=render_agent_bridge_skill(),
+        shared_root=shared_root,
+        bridge_dir=BRIDGE_DIR,
+        config_loader=lambda: load_config(DEFAULT_CONFIG),
+    )
+    _json_print(report) if args.json else print(format_doctor(report), end="")
+    return 0 if report["ok"] else 1
+
+
 def format_shared_skill_install(result: dict[str, Any]) -> str:
     lines = [
         f"Shared Agent Bridge: {result['shared_bridge_dir']}",
@@ -1594,6 +1702,7 @@ def harness_cmd(argv: list[str]) -> int:
     install = sub.add_parser("install-skill", help="Install the shared Agent Bridge skill package.")
     install.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
     install.add_argument("--link-client", choices=["none", "codex", "claude", "agents", "all"], default="all")
+    install.add_argument("--check", action="store_true", help="Report skill/symlink drift without writing anything.")
     install.add_argument("--json", action="store_true")
 
     register = sub.add_parser("register", help="Write a shared registry heartbeat for this harness.")
@@ -1609,6 +1718,10 @@ def harness_cmd(argv: list[str]) -> int:
 
     args = parser.parse_args(argv)
     if args.cmd == "install-skill":
+        if args.check:
+            result = check_shared_skill(args.root, link_client=args.link_client)
+            _json_print(result) if args.json else print(format_shared_skill_check(result), end="")
+            return 0 if result["ok"] else 1
         result = install_shared_skill(args.root, link_client=args.link_client)
         _json_print(result) if args.json else print(format_shared_skill_install(result), end="")
         return 0
@@ -1626,7 +1739,11 @@ def trace_cmd(argv: list[str]) -> int:
     parser.add_argument("--run-id")
     parser.add_argument("--type", dest="event_type")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--envelope", action="store_true", help="Emit portable event envelopes with traceparent context (JSON)")
     args = parser.parse_args(argv)
+    if args.envelope:
+        _json_print(export_envelopes(run_id=args.run_id, event_type=args.event_type))
+        return 0
     rows = load_events(run_id=args.run_id, event_type=args.event_type)
     if args.json:
         _json_print(rows)
@@ -1802,20 +1919,30 @@ def workflow_cmd(argv: list[str]) -> int:
         return 0
 
     config = load_config(Path(args.config))
-    result = run_workflow(
-        workflow_id=args.workflow_id,
-        question=question,
-        tier=args.tier,
-        engine=args.engine,
-        source=args.source,
-        agents=agent_map(config),
-        project_dir=PROJECT_DIR,
-        concurrency=args.concurrency,
-        fmt=args.format,
-        model=args.model,
-        budget_usd=str(args.budget_usd),
-        meta=meta,
-    )
+    set_trace_context(meta)
+    record_run_task("created", meta=meta, command="workflow", data={"workflow_id": args.workflow_id, "tier": args.tier})
+    try:
+        result = run_workflow(
+            workflow_id=args.workflow_id,
+            question=question,
+            tier=args.tier,
+            engine=args.engine,
+            source=args.source,
+            agents=agent_map(config),
+            project_dir=PROJECT_DIR,
+            concurrency=args.concurrency,
+            fmt=args.format,
+            model=args.model,
+            budget_usd=str(args.budget_usd),
+            meta=meta,
+        )
+    except Exception:
+        record_run_task("failed", meta=meta, command="workflow")
+        raise
+    artifact_dir = result.get("artifact_dir")
+    if artifact_dir:
+        record_run_task("artifact_attached", meta=meta, command="workflow", artifact={"path": str(artifact_dir), "kind": "dir"})
+    record_run_task("completed", meta=meta, command="workflow", data={"status": result.get("status")})
     if args.format == "json":
         _json_print(result)
     elif args.format == "text":
@@ -1924,6 +2051,11 @@ def loop(argv: list[str]) -> int:
 
     base_meta = ensure_run_meta(extract_meta(args))
     base_meta.setdefault("loop_id", base_meta.get("run_id", "run").replace("run_", "loop_", 1))
+    policy_rc = _enforce_dispatch_policy("loop", source=args.source, mode="code", meta=base_meta)
+    if policy_rc is not None:
+        return policy_rc
+    set_trace_context(base_meta)
+    record_run_task("created", meta=base_meta, command="loop", data={"spawn_policy": args.spawn_policy})
     emit_event(
         "run.created",
         run_id=base_meta.get("run_id"),
@@ -2002,6 +2134,8 @@ def loop(argv: list[str]) -> int:
         meta=base_meta,
         data={"command": "loop", "return_code": rc, "dry_run": args.dry_run, "events": str(events_path())},
     )
+    record_run_task("artifact_attached", meta=base_meta, command="loop", artifact={"path": str(events_path()), "kind": "trace"})
+    record_run_task("completed" if rc == 0 else "failed", meta=base_meta, command="loop", data={"return_code": rc})
     print(f"run_id: {base_meta['run_id']}")
     print(f"loop_id: {base_meta['loop_id']}")
     print(f"dispatch_decision: {decision.mode}")
@@ -2032,6 +2166,10 @@ def main(argv: list[str]) -> int:
         return hooks_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "harness":
         return harness_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "doctor":
+        return doctor_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] in {"capabilities", "tasks", "transport", "policy", "eval", "daemon"}:
+        return coord_cmd(argv[1], argv[2:])
     if len(argv) >= 1 and argv[0] == "bridge":
         return bridge(argv[1:])
     print("usage: agent code bridge [options]", file=sys.stderr)
@@ -2043,6 +2181,13 @@ def main(argv: list[str]) -> int:
     print("       agent code hook session-start [options]", file=sys.stderr)
     print("       agent code hooks <install|status> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
+    print("       agent code doctor [options]", file=sys.stderr)
+    print("       agent code capabilities [options]", file=sys.stderr)
+    print("       agent code tasks <create|claim|update|request-input|cancel|resume|attach|inspect|list> [options]", file=sys.stderr)
+    print("       agent code transport <send|receive|ack|status|smoke> [options]", file=sys.stderr)
+    print("       agent code policy <check|show|sign|verify> [options]", file=sys.stderr)
+    print("       agent code eval [options]", file=sys.stderr)
+    print("       agent code daemon status", file=sys.stderr)
     print("       agent workflow <list|show|run|inspect> [options]", file=sys.stderr)
     print("       agent bridge [options]", file=sys.stderr)
     return 2

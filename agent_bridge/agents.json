@@ -15,6 +15,70 @@
       "command": "codex",
       "env_command": "CODEX_BIN",
       "description": "OpenAI Codex headless CLI"
+    },
+    {
+      "id": "grok",
+      "label": "Grok Build",
+      "adapter": "argv",
+      "command": "grok",
+      "env_command": "GROK_BIN",
+      "description": "xAI Grok local coding CLI",
+      "review_args": [
+        "-p",
+        "{prompt}",
+        "--system-prompt-override",
+        "{scope}",
+        "--cwd",
+        "{project_dir}",
+        "--permission-mode",
+        "auto",
+        "--output-format",
+        "plain",
+        "--disable-web-search",
+        "--max-turns",
+        "1"
+      ],
+      "code_args": [
+        "-p",
+        "{prompt}",
+        "--system-prompt-override",
+        "{scope}",
+        "--cwd",
+        "{project_dir}",
+        "--permission-mode",
+        "acceptEdits",
+        "--output-format",
+        "plain",
+        "--disable-web-search",
+        "--max-turns",
+        "8"
+      ]
+    },
+    {
+      "id": "agy",
+      "label": "Anti-Gravity",
+      "adapter": "argv",
+      "command": "agy",
+      "env_command": "AGY_BIN",
+      "description": "Anti-Gravity local coding CLI",
+      "review_args": [
+        "--print",
+        "{scope}\n\n[BRIDGE REQUEST FROM {source}]\n{prompt}",
+        "--add-dir",
+        "{project_dir}",
+        "--sandbox",
+        "--print-timeout",
+        "10m"
+      ],
+      "code_args": [
+        "--print",
+        "{scope}\n\n[BRIDGE REQUEST FROM {source}]\n{prompt}",
+        "--add-dir",
+        "{project_dir}",
+        "--dangerously-skip-permissions",
+        "--print-timeout",
+        "20m"
+      ]
     }
   ]
 }

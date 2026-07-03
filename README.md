@@ -115,6 +115,12 @@ agent code bridge --from human --to claude --mode review \
 
 agent code bridge --from human --to codex --mode code \
   --prompt "Implement the scoped change and run focused tests."
+
+agent code bridge --from human --to grok --mode review \
+  --prompt "Review the current diff for concrete defects."
+
+agent code bridge --from human --to agy --mode code \
+  --prompt "Implement the scoped change and run focused tests."
 ```
 
 The bridge targets the current git root by default. Use `--project-dir` to target a different
@@ -130,6 +136,9 @@ List configured agents:
 ```bash
 agent code bridge --list
 ```
+
+Agent commands are resolved from `PATH` by default. Override local CLI paths with
+`CLAUDE_BIN`, `CODEX_BIN`, `GROK_BIN`, or `AGY_BIN` when a harness is installed outside `PATH`.
 
 Dry-run without invoking model CLIs:
 

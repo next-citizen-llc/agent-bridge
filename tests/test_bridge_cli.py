@@ -13,6 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 AGENT = ROOT / "bin" / "agent"
 
 
+def _base_env() -> dict[str, str]:
+    """Copy of os.environ without ANTHROPIC_* vars so host shells (e.g. agent
+    sessions with ANTHROPIC_BASE_URL set) cannot poison auth-preflight tests."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")}
+
+
 class BridgeCliTests(unittest.TestCase):
     def _write_fake_claude(self, tmp: str) -> Path:
         fake = Path(tmp) / "fake_claude.py"
@@ -89,7 +95,7 @@ class BridgeCliTests(unittest.TestCase):
             repo = Path(tmp) / "sample"
             repo.mkdir()
             subprocess.run(["git", "init"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            env = {**_base_env(), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
             proc = subprocess.run(
                 [
                     str(AGENT),
@@ -120,7 +126,7 @@ class BridgeCliTests(unittest.TestCase):
 
     def test_loop_dry_run_emits_ordered_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            env = {**_base_env(), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
             proc = subprocess.run(
                 [
                     str(AGENT),
@@ -162,7 +168,7 @@ class BridgeCliTests(unittest.TestCase):
 
     def test_loop_auto_uses_one_adversarial_agent_for_vague_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            env = {**_base_env(), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
             proc = subprocess.run(
                 [
                     str(AGENT),
@@ -207,7 +213,7 @@ class BridgeCliTests(unittest.TestCase):
             "and adversarial validation."
         )
         with tempfile.TemporaryDirectory() as tmp:
-            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            env = {**_base_env(), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
             proc = subprocess.run(
                 [
                     str(AGENT),
@@ -242,7 +248,7 @@ class BridgeCliTests(unittest.TestCase):
 
     def test_codex_dry_run_uses_current_exec_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            env = {**_base_env(), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
             proc = subprocess.run(
                 [
                     str(AGENT),
@@ -284,7 +290,7 @@ class BridgeCliTests(unittest.TestCase):
                 encoding="utf-8",
             )
             env = {
-                **os.environ,
+                **_base_env(),
                 "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state"),
                 "AGENT_BRIDGE_HEIC_CONVERTER": f"{sys.executable} {converter}",
             }
@@ -325,7 +331,7 @@ class BridgeCliTests(unittest.TestCase):
             photo = repo / "broken.heic"
             photo.write_bytes(b"fake heic")
             env = {
-                **os.environ,
+                **_base_env(),
                 "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state"),
                 "AGENT_BRIDGE_HEIC_CONVERTER": str(Path(tmp) / "missing-converter"),
             }
@@ -361,7 +367,7 @@ class BridgeCliTests(unittest.TestCase):
             state = Path(tmp) / "state"
             log = Path(tmp) / "fake.log"
             env = {
-                **os.environ,
+                **_base_env(),
                 "AGENT_BRIDGE_STATE_DIR": str(state),
                 "CLAUDE_BIN": str(fake),
                 "FAKE_CLAUDE_LOG": str(log),
@@ -406,7 +412,7 @@ class BridgeCliTests(unittest.TestCase):
             log = Path(tmp) / "fake.log"
             marker = Path(tmp) / "auth.marker"
             env = {
-                **os.environ,
+                **_base_env(),
                 "AGENT_BRIDGE_STATE_DIR": str(state),
                 "CLAUDE_BIN": str(fake),
                 "FAKE_CLAUDE_LOG": str(log),
@@ -445,7 +451,7 @@ class BridgeCliTests(unittest.TestCase):
 
     def test_bridge_child_role_uses_target_not_forwarded_caller_role(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            env = {**_base_env(), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
             proc = subprocess.run(
                 [
                     str(AGENT),
@@ -494,7 +500,7 @@ class BridgeCliTests(unittest.TestCase):
             shared_root = Path(tmp) / "SharedAgentSkills"
             (shared_root / "Agent-Bridge").mkdir(parents=True)
             env = {
-                **os.environ,
+                **_base_env(),
                 "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(shared_root),
                 "AGENT_BRIDGE_MACHINE_ID": "test-machine",
             }
@@ -523,7 +529,7 @@ class BridgeCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             shared_root = Path(tmp) / "SharedAgentSkills"
             env = {
-                **os.environ,
+                **_base_env(),
                 "AGENT_BRIDGE_MACHINE_ID": "test-machine",
                 "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(shared_root),
             }
@@ -557,7 +563,7 @@ class BridgeCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
             shared_root = Path(tmp) / "SharedAgentSkills"
-            env = {**os.environ, "HOME": str(home), "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(shared_root)}
+            env = {**_base_env(), "HOME": str(home), "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(shared_root)}
             proc = subprocess.run(
                 [str(AGENT), "code", "harness", "install-skill", "--json"],
                 cwd=str(ROOT),
@@ -651,7 +657,7 @@ class BridgeCliTests(unittest.TestCase):
             codex_skills.mkdir(parents=True)
             (codex_skills / "beta-skill").mkdir()
             (codex_skills / "beta-skill" / "SKILL.md").write_text("local", encoding="utf-8")
-            env = {**os.environ, "HOME": str(home), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            env = {**_base_env(), "HOME": str(home), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
 
             proc = subprocess.run(
                 [str(AGENT), "code", "skills", "install", "--repo", str(vault), "--client", "codex", "--json"],
@@ -697,7 +703,7 @@ class BridgeCliTests(unittest.TestCase):
             codex_skills = home / ".codex" / "skills"
             codex_skills.mkdir(parents=True)
             os.symlink(legacy, codex_skills / "alpha-skill", target_is_directory=True)
-            env = {**os.environ, "HOME": str(home), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            env = {**_base_env(), "HOME": str(home), "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
 
             proc = subprocess.run(
                 [str(AGENT), "code", "skills", "install", "--repo", str(vault), "--client", "codex", "--json"],
@@ -720,7 +726,7 @@ class BridgeCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fake = self._write_fake_claude(tmp)
             env = {
-                **os.environ,
+                **_base_env(),
                 "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state"),
                 "CLAUDE_BIN": str(fake),
                 "FAKE_CLAUDE_LOG": str(Path(tmp) / "fake.log"),
@@ -744,7 +750,7 @@ class BridgeCliTests(unittest.TestCase):
 
     def test_hooks_install_is_idempotent_for_codex_and_claude(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            env = {**os.environ, "HOME": tmp, "AGENT_BRIDGE_HOOK_AGENT": "/tmp/agent"}
+            env = {**_base_env(), "HOME": tmp, "AGENT_BRIDGE_HOOK_AGENT": "/tmp/agent"}
             codex_dir = Path(tmp) / ".codex"
             claude_dir = Path(tmp) / ".claude"
             codex_dir.mkdir()
@@ -782,7 +788,7 @@ class BridgeCliTests(unittest.TestCase):
     def test_hooks_install_uses_windows_cmd_wrapper_for_cmd_shim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env = {
-                **os.environ,
+                **_base_env(),
                 "HOME": tmp,
                 "AGENT_BRIDGE_HOOK_AGENT": r"C:\Users\me\.local\bin\agent.cmd",
             }

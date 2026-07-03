@@ -22,6 +22,7 @@ class BridgeCliTests(unittest.TestCase):
             "import json\n"
             "import os\n"
             "import sys\n"
+            "import time\n"
             "log = Path(os.environ['FAKE_CLAUDE_LOG'])\n"
             "marker = Path(os.environ.get('FAKE_CLAUDE_AUTH_MARKER', log.with_suffix('.auth')))\n"
             "def log_line(text):\n"
@@ -46,8 +47,16 @@ class BridgeCliTests(unittest.TestCase):
             "    if '--max-budget-usd' in args:\n"
             "        budget = args[args.index('--max-budget-usd') + 1]\n"
             "    log_line('budget ' + budget)\n"
+            "    if 'HANG_FOREVER' in prompt:\n"
+            "        print('started hang', flush=True)\n"
+            "        time.sleep(30)\n"
+            "        raise SystemExit(0)\n"
             "    if os.environ.get('FAKE_CLAUDE_AUTH_FAIL') == '1' and not marker.exists():\n"
             "        print('Failed to authenticate. API Error: 401 Invalid authentication credentials')\n"
+            "        raise SystemExit(1)\n"
+            "    if 'PROGRESS_THEN_BUDGET' in prompt and float(budget) < float(os.environ.get('FAKE_CLAUDE_MIN_BUDGET', '0.5')):\n"
+            "        print('[agent-bridge-status] {\"percent_complete\": 72, \"sample\": \"patched cli timeout path\"}', flush=True)\n"
+            "        print(f'Error: Exceeded USD budget ({budget})')\n"
             "        raise SystemExit(1)\n"
             "    if float(budget) < float(os.environ.get('FAKE_CLAUDE_MIN_BUDGET', '0.5')):\n"
             "        print(f'Error: Exceeded USD budget ({budget})')\n"
@@ -396,6 +405,153 @@ class BridgeCliTests(unittest.TestCase):
         self.assertEqual(state_payload["agents"]["claude"]["calibrated_budget_usd"], "0.5")
         self.assertEqual(log_lines, ["budget 0.05", "budget 0.1", "budget 0.2", "budget 0.5"])
 
+    def test_bridge_idle_timeout_terminates_and_records_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self._write_fake_claude(tmp)
+            state = Path(tmp) / "state"
+            log = Path(tmp) / "fake.log"
+            env = {
+                **os.environ,
+                "AGENT_BRIDGE_STATE_DIR": str(state),
+                "CLAUDE_BIN": str(fake),
+                "FAKE_CLAUDE_LOG": str(log),
+            }
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "bridge",
+                    "--from",
+                    "human",
+                    "--to",
+                    "claude",
+                    "--mode",
+                    "review",
+                    "--prompt",
+                    "HANG_FOREVER",
+                    "--idle-timeout-seconds",
+                    "0.5",
+                    "--timeout-seconds",
+                    "5",
+                    "--poll-interval-seconds",
+                    "0.1",
+                    "--no-budget-auto",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            rows = [
+                json.loads(line)
+                for line in (state / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            transcript = next((state / "transcripts").glob("*.txt"))
+            transcript_text = transcript.read_text(encoding="utf-8")
+        self.assertEqual(proc.returncode, 124)
+        self.assertIn("idle timed out after 0.5s", transcript_text)
+        self.assertTrue(any(row["type"] == "agent.completed" and row["data"]["return_code"] == 124 for row in rows))
+        self.assertTrue(any(row["type"] == "run.completed" and row["data"]["return_code"] == 124 for row in rows))
+
+    def test_bridge_progress_signal_earns_larger_budget_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self._write_fake_claude(tmp)
+            state = Path(tmp) / "state"
+            log = Path(tmp) / "fake.log"
+            env = {
+                **os.environ,
+                "AGENT_BRIDGE_STATE_DIR": str(state),
+                "CLAUDE_BIN": str(fake),
+                "FAKE_CLAUDE_LOG": str(log),
+                "FAKE_CLAUDE_MIN_BUDGET": "3",
+            }
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "bridge",
+                    "--from",
+                    "human",
+                    "--to",
+                    "claude",
+                    "--mode",
+                    "review",
+                    "--budget-usd",
+                    "1",
+                    "--max-auto-budget-usd",
+                    "3",
+                    "--progress-bonus-usd",
+                    "2",
+                    "--prompt",
+                    "PROGRESS_THEN_BUDGET then Reply exactly: BRIDGE_LIVE_OK",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            rows = [
+                json.loads(line)
+                for line in (state / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            log_lines = [line.strip() for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("BRIDGE_LIVE_OK", proc.stdout)
+        self.assertIn("promising progress before budget cap; retrying with 3", proc.stderr)
+        self.assertEqual(log_lines, ["budget 1", "budget 3"])
+        self.assertTrue(any(row["type"] == "agent.progress" for row in rows))
+        retry = next(row for row in rows if row["type"] == "agent.progress_budget_retry")
+        self.assertEqual(retry["data"]["to_budget_usd"], "3")
+
+    def test_bridge_splits_broad_code_issue_handoff(self) -> None:
+        prompt = (
+            "Implement roadmap items for #12 #13 #14 #15 with tests and backward compatible trace, "
+            "task ledger, transport, policy, and evaluation updates. "
+            + "Keep the implementation scoped and report verification. " * 8
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "bridge",
+                    "--from",
+                    "human",
+                    "--to",
+                    "claude",
+                    "--mode",
+                    "code",
+                    "--prompt",
+                    prompt,
+                    "--split-issues",
+                    "on",
+                    "--dry-run",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            rows = [
+                json.loads(line)
+                for line in (Path(tmp) / "state" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("split broad code handoff into 4 issue slices", proc.stderr)
+        self.assertEqual(proc.stdout.count("[dry-run] claude:"), 4)
+        self.assertTrue(any(row["type"] == "agent.handoff_split" for row in rows))
+        self.assertEqual([row["data"]["slice"] for row in rows if row["type"] == "agent.slice_started"], ["#12", "#13", "#14", "#15"])
+
     def test_repair_refreshes_claude_auth_and_checks_bridge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fake = self._write_fake_claude(tmp)
@@ -616,6 +772,45 @@ class BridgeCliTests(unittest.TestCase):
             self.assertEqual(len(payload["harnesses"]), 1)
             self.assertEqual(payload["harnesses"][0]["client"], "codex")
             self.assertTrue(payload["harnesses"][0]["fresh"])
+
+    def test_harness_status_discovers_nextcz_cloudstorage_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            shared_root = home / "Library" / "CloudStorage" / "OneDrive-nextcz.com" / "SharedAgentSkills"
+            registry = shared_root / "Agent-Bridge" / "registry"
+            registry.mkdir(parents=True)
+            (registry / "test.codex.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "updated_at": "2026-07-03T00:00:00Z",
+                        "status": "active",
+                        "client": "codex",
+                        "machine_id": "test",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env = {
+                **os.environ,
+                "HOME": str(home),
+            }
+            for key in ("AGENT_BRIDGE_SHARED_SKILLS_ROOT", "SHARED_AGENT_SKILLS_ROOT", "CAREER_SHARED_SKILLS_ROOT"):
+                env.pop(key, None)
+            proc = subprocess.run(
+                [str(AGENT), "code", "harness", "status", "--json", "--stale-minutes", "9999999"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            payload = json.loads(proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(payload["shared_bridge_dir"], str(shared_root / "Agent-Bridge"))
+        self.assertEqual(payload["harnesses"][0]["client"], "codex")
 
     def test_harness_install_skill_writes_skill_and_local_links(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -13,6 +13,7 @@ the caller is Codex or Claude.
 from __future__ import annotations
 
 import argparse
+import queue
 from dataclasses import dataclass
 import datetime as dt
 import getpass
@@ -27,6 +28,8 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
+import time
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -99,6 +102,10 @@ SHARED_SKILL_LINK_NAME = "agent-bridge"
 DEFAULT_BUDGET_USD = "0.50"
 DEFAULT_REPAIR_BUDGET_USD = "0.05"
 DEFAULT_MAX_AUTO_BUDGET_USD = "1.00"
+DEFAULT_DISPATCH_TIMEOUT_SECONDS = 900.0
+DEFAULT_IDLE_TIMEOUT_SECONDS = 180.0
+DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+DEFAULT_PROGRESS_BONUS_USD = "1.00"
 BUDGET_RETRY_LADDER = [0.10, 0.20, 0.50, 1.00, 2.00, 5.00]
 HEIC_SUFFIXES = {".heic", ".heif"}
 QUOTED_HEIC_PATH_RE = re.compile(
@@ -136,6 +143,7 @@ class AgentRunResult:
     output: str
     transcript: Path | None = None
     usage: dict[str, Any] | None = None
+    progress: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +152,14 @@ class ProbeResult:
     budget_usd: str
     output: str
     repaired_auth: bool = False
+
+
+@dataclass(frozen=True)
+class DispatchLimits:
+    timeout_seconds: float
+    idle_timeout_seconds: float
+    poll_interval_seconds: float
+    progress_bonus_usd: str
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -342,6 +358,16 @@ def _format_budget(value: str | float | int) -> str:
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
+def _positive_float(value: str | float | int, *, name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(f"{name} must be a number, got {value!r}") from exc
+    if number <= 0:
+        raise BridgeError(f"{name} must be greater than zero")
+    return number
+
+
 def calibrated_budget(agent_id: str, requested: str, *, enabled: bool = True) -> str:
     if not enabled:
         return requested
@@ -363,6 +389,42 @@ def next_budget(current: str, max_budget: str) -> str | None:
             return _format_budget(candidate) if candidate <= max_value + 0.000001 else None
     doubled = current_value * 2
     return _format_budget(doubled) if doubled <= max_value + 0.000001 else None
+
+
+def broad_code_handoff(prompt: str, mode: str) -> bool:
+    if mode != "code":
+        return False
+    words = prompt.split()
+    issue_refs = issue_refs_in_prompt(prompt)
+    return len(words) >= 100 or len(issue_refs) >= 3
+
+
+def recommended_initial_budget(requested: str, max_budget: str, *, prompt: str, mode: str) -> str:
+    if not broad_code_handoff(prompt, mode):
+        return requested
+    requested_value = _budget_float(requested)
+    max_value = _budget_float(max_budget)
+    target = min(max_value, max(requested_value, 2.0))
+    return _format_budget(target)
+
+
+def incentive_budget(current: str, max_budget: str, progress: dict[str, Any] | None, bonus_usd: str) -> str | None:
+    if not progress or not progress.get("promising"):
+        return next_budget(current, max_budget)
+    current_value = _budget_float(current)
+    max_value = _budget_float(max_budget)
+    bonus = max(_budget_float(bonus_usd), 0.0)
+    multiplier = 1.0
+    percent = progress.get("max_percent")
+    if isinstance(percent, (int, float)) and percent >= 70:
+        multiplier = 2.0
+    candidate = current_value + (bonus * multiplier)
+    ladder = next_budget(current, max_budget)
+    if ladder is not None:
+        candidate = max(candidate, _budget_float(ladder))
+    if candidate <= current_value + 0.000001:
+        return None
+    return _format_budget(min(candidate, max_value)) if candidate <= max_value + 0.000001 or current_value < max_value else None
 
 
 def is_budget_error(output: str) -> bool:
@@ -820,6 +882,273 @@ def _usage_record(
     }
 
 
+STATUS_MARKER_RE = re.compile(r"(?:\[agent-bridge-status\]|AGENT_BRIDGE_STATUS)[:\s]*(?P<body>.*)", re.IGNORECASE)
+PERCENT_RE = re.compile(r"\b(?P<percent>100|[1-9]?\d)\s*%\s*(?:complete|done|progress)?\b", re.IGNORECASE)
+ISSUE_REF_RE = re.compile(r"(?<![\w/])#(?P<number>\d+)\b")
+PROMISING_TEXT_RE = re.compile(
+    r"\b("
+    r"created|updated|patched|wrote|implemented|added|fixed|passing|tests?\s+pass|"
+    r"diff --git|files?\s+changed|sample|in\s+progress"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def issue_refs_in_prompt(prompt: str) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for match in ISSUE_REF_RE.finditer(prompt):
+        ref = f"#{match.group('number')}"
+        if ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    return refs
+
+
+def should_split_issue_handoff(prompt: str, mode: str, split_policy: str) -> bool:
+    if split_policy == "off" or mode != "code":
+        return False
+    refs = issue_refs_in_prompt(prompt)
+    if len(refs) < 3:
+        return False
+    if split_policy == "on":
+        return True
+    return len(prompt.split()) >= 80
+
+
+def split_issue_prompts(prompt: str) -> list[tuple[str, str]]:
+    refs = issue_refs_in_prompt(prompt)
+    if len(refs) < 3:
+        return [("all", prompt)]
+    chunks: list[tuple[str, str]] = []
+    total = len(refs)
+    for index, ref in enumerate(refs, start=1):
+        chunk = (
+            f"Split handoff slice {index}/{total}: focus on {ref} only. "
+            "Preserve compatibility with sibling slices; do not push, merge, or close issues. "
+            "Report explicit progress using lines like "
+            "`[agent-bridge-status] {\"percent_complete\": 50, \"sample\": \"changed files: ...\"}` "
+            "when useful.\n\n"
+            "Original request:\n"
+            f"{prompt}"
+        )
+        chunks.append((ref, chunk))
+    return chunks
+
+
+def _parse_status_marker(line: str) -> dict[str, Any]:
+    match = STATUS_MARKER_RE.search(line)
+    if not match:
+        return {}
+    body = match.group("body").strip()
+    if not body:
+        return {"kind": "status_marker"}
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return {"kind": "status_marker", "sample": body[:240]}
+    return payload if isinstance(payload, dict) else {"kind": "status_marker", "sample": str(payload)[:240]}
+
+
+def _line_progress_signal(line: str) -> dict[str, Any] | None:
+    marker = _parse_status_marker(line)
+    percent = None
+    sample = None
+    if marker:
+        raw_percent = marker.get("percent_complete", marker.get("percent", marker.get("progress")))
+        if isinstance(raw_percent, str) and raw_percent.strip().endswith("%"):
+            raw_percent = raw_percent.strip()[:-1]
+        try:
+            percent = float(raw_percent) if raw_percent is not None else None
+        except (TypeError, ValueError):
+            percent = None
+        raw_sample = marker.get("sample") or marker.get("code_sample") or marker.get("changed_files") or marker.get("status")
+        sample = str(raw_sample)[:240] if raw_sample is not None else None
+    if percent is None:
+        percent_match = PERCENT_RE.search(line)
+        if percent_match:
+            percent = float(percent_match.group("percent"))
+    promising_text = bool(PROMISING_TEXT_RE.search(line))
+    if marker or percent is not None or promising_text:
+        signal: dict[str, Any] = {
+            "source": "stdout",
+            "promising": True,
+            "sample": sample or line.strip()[:240],
+        }
+        if percent is not None:
+            signal["percent"] = max(0.0, min(100.0, percent))
+        return signal
+    return None
+
+
+def _git_progress_signature() -> str:
+    status = run_git(["status", "--short"])
+    stat = run_git(["diff", "--stat"])
+    staged = run_git(["diff", "--cached", "--stat"])
+    return "\n".join(part for part in (status, stat, staged) if part)
+
+
+def _record_progress(
+    progress: dict[str, Any],
+    signal: dict[str, Any],
+    *,
+    agent_id: str,
+    meta: dict[str, Any],
+    transcript_handle: Any | None = None,
+    log_handle: Any | None = None,
+) -> None:
+    progress["promising"] = True
+    progress["count"] = int(progress.get("count", 0)) + 1
+    if signal.get("percent") is not None:
+        progress["max_percent"] = max(float(progress.get("max_percent", 0)), float(signal["percent"]))
+    sample = signal.get("sample")
+    if sample:
+        samples = progress.setdefault("samples", [])
+        if isinstance(samples, list) and sample not in samples:
+            samples.append(sample)
+            del samples[5:]
+    progress["last_source"] = signal.get("source", "unknown")
+    event_data = {"target": agent_id, **{key: value for key, value in signal.items() if key != "promising"}}
+    emit_event("agent.progress", run_id=meta.get("run_id"), meta=meta, data=event_data)
+    note = f"[agent-bridge] progress detected: {event_data}\n"
+    if transcript_handle is not None:
+        transcript_handle.write(note)
+        transcript_handle.flush()
+    if log_handle is not None:
+        log_handle.write(note)
+        log_handle.flush()
+
+
+def _terminate_process(process: subprocess.Popen[str], *, grace_seconds: float = 2.0) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _run_bounded_process(
+    cmd: list[str],
+    *,
+    agent_id: str,
+    meta: dict[str, Any],
+    transcript: Path,
+    limits: DispatchLimits,
+) -> AgentRunResult:
+    output: list[str] = []
+    progress: dict[str, Any] = {"promising": False, "count": 0, "max_percent": 0.0, "samples": []}
+    line_queue: queue.Queue[str | None] = queue.Queue()
+    start = time.monotonic()
+    last_activity = start
+    last_poll = start
+    initial_signature = _git_progress_signature()
+    last_signature = initial_signature
+
+    with transcript.open("a", encoding="utf-8") as transcript_handle, BRIDGE_LOG.open("a", encoding="utf-8") as log_handle:
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+
+        def _reader() -> None:
+            try:
+                for line in process.stdout or []:
+                    line_queue.put(line)
+            finally:
+                line_queue.put(None)
+
+        reader = threading.Thread(target=_reader, name=f"agent-bridge-reader-{agent_id}", daemon=True)
+        reader.start()
+        timed_out_reason = ""
+        stdout_closed = False
+
+        while True:
+            now = time.monotonic()
+            elapsed = now - start
+            idle = now - last_activity
+            if elapsed > limits.timeout_seconds:
+                timed_out_reason = f"timed out after {limits.timeout_seconds:g}s"
+                break
+            if idle > limits.idle_timeout_seconds:
+                timed_out_reason = f"idle timed out after {limits.idle_timeout_seconds:g}s"
+                break
+
+            wait_for = min(limits.poll_interval_seconds, max(0.05, limits.idle_timeout_seconds - idle), max(0.05, limits.timeout_seconds - elapsed))
+            try:
+                line = line_queue.get(timeout=wait_for)
+            except queue.Empty:
+                line = "__POLL__"
+
+            if line is None:
+                stdout_closed = True
+                if process.poll() is not None:
+                    break
+                continue
+
+            if line == "__POLL__":
+                now = time.monotonic()
+                if now - last_poll >= limits.poll_interval_seconds:
+                    last_poll = now
+                    current_signature = _git_progress_signature()
+                    if current_signature and current_signature != last_signature:
+                        last_signature = current_signature
+                        last_activity = now
+                        _record_progress(
+                            progress,
+                            {"source": "worktree_poll", "sample": current_signature[:240], "promising": True},
+                            agent_id=agent_id,
+                            meta=meta,
+                            transcript_handle=transcript_handle,
+                            log_handle=log_handle,
+                        )
+                if stdout_closed and process.poll() is not None:
+                    break
+                continue
+
+            last_activity = time.monotonic()
+            print(line, end="")
+            output.append(line)
+            transcript_handle.write(line)
+            transcript_handle.flush()
+            log_handle.write(line)
+            log_handle.flush()
+            signal = _line_progress_signal(line)
+            if signal:
+                _record_progress(
+                    progress,
+                    signal,
+                    agent_id=agent_id,
+                    meta=meta,
+                    transcript_handle=transcript_handle,
+                    log_handle=log_handle,
+                )
+
+        if timed_out_reason:
+            _terminate_process(process)
+            timeout_line = f"\n[agent-bridge] {timed_out_reason}; terminated {agent_id}\n"
+            output.append(timeout_line)
+            transcript_handle.write(timeout_line)
+            log_handle.write(timeout_line)
+            transcript_handle.flush()
+            log_handle.flush()
+            return AgentRunResult(return_code=124, output="".join(output), transcript=transcript, progress=progress)
+
+        rc = process.wait()
+        reader.join(timeout=1)
+        return AgentRunResult(return_code=rc, output="".join(output), transcript=transcript, progress=progress)
+
+
 def _invoke_target_once(
     agent: dict[str, Any],
     *,
@@ -831,8 +1160,15 @@ def _invoke_target_once(
     meta: dict[str, Any] | None = None,
     media_dirs: list[Path] | None = None,
     route_policy: str = "standard",
+    limits: DispatchLimits | None = None,
 ) -> AgentRunResult:
     meta = meta or {}
+    limits = limits or DispatchLimits(
+        timeout_seconds=DEFAULT_DISPATCH_TIMEOUT_SECONDS,
+        idle_timeout_seconds=DEFAULT_IDLE_TIMEOUT_SECONDS,
+        poll_interval_seconds=DEFAULT_POLL_INTERVAL_SECONDS,
+        progress_bonus_usd=DEFAULT_PROGRESS_BONUS_USD,
+    )
     scope = build_scope(source, agent, mode, meta)
     dispatch_meta = _dispatch_metadata(agent=agent, prompt=prompt, scope=scope, route_policy=route_policy)
     cmd = command_for_agent(
@@ -942,23 +1278,13 @@ def _invoke_target_once(
     transcript = TRANSCRIPT_DIR / f"{prefix}_{turn}_{agent['id']}_{utc_stamp()}.txt"
     write_header(transcript, source=source, target=agent["id"], mode=mode, prompt=prompt, cmd=cmd, meta=meta)
 
-    output: list[str] = []
-    with transcript.open("a", encoding="utf-8") as transcript_handle, BRIDGE_LOG.open("a", encoding="utf-8") as log_handle:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(PROJECT_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="")
-            output.append(line)
-            transcript_handle.write(line)
-            log_handle.write(line)
-        rc = process.wait()
+    result = _run_bounded_process(
+        cmd,
+        agent_id=agent["id"],
+        meta=meta,
+        transcript=transcript,
+        limits=limits,
+    )
     usage_record = _usage_record(
         agent=agent,
         mode=mode,
@@ -966,17 +1292,25 @@ def _invoke_target_once(
         prompt=prompt,
         scope=scope,
         metadata=dispatch_meta,
-        provider_usage=parse_usage_metadata(_maybe_json("".join(output))),
+        provider_usage=parse_usage_metadata(_maybe_json(result.output)),
     )
     _append_usage_record(run_id=meta.get("run_id"), command="bridge", budget_usd=budget_usd, record=usage_record)
     emit_event(
         "agent.completed",
         run_id=meta.get("run_id"),
         meta=meta,
-        data={"target": agent["id"], "mode": mode, "return_code": rc, "dry_run": False, "transcript": str(transcript), "usage": usage_record},
+        data={
+            "target": agent["id"],
+            "mode": mode,
+            "return_code": result.return_code,
+            "dry_run": False,
+            "transcript": str(transcript),
+            "usage": usage_record,
+            "progress": result.progress or {},
+        },
     )
     print(f"\n[transcript] {transcript}", file=sys.stderr)
-    return AgentRunResult(return_code=rc, output="".join(output), transcript=transcript, usage=usage_record)
+    return AgentRunResult(return_code=result.return_code, output=result.output, transcript=transcript, usage=usage_record, progress=result.progress)
 
 
 def _maybe_json(text: str) -> dict[str, Any] | None:
@@ -1003,8 +1337,20 @@ def invoke_target(
     budget_auto: bool = True,
     max_auto_budget_usd: str = DEFAULT_MAX_AUTO_BUDGET_USD,
     route_policy: str = "standard",
+    limits: DispatchLimits | None = None,
 ) -> int:
     budget = calibrated_budget(agent["id"], budget_usd, enabled=budget_auto and not dry_run)
+    if budget_auto and not dry_run:
+        adjusted = recommended_initial_budget(budget, max_auto_budget_usd, prompt=prompt, mode=mode)
+        if adjusted != budget:
+            emit_event(
+                "agent.budget_start_adjusted",
+                run_id=(meta or {}).get("run_id"),
+                meta=meta or {},
+                data={"target": agent["id"], "from_budget_usd": _format_budget(budget), "to_budget_usd": adjusted, "reason": "broad_code_handoff"},
+            )
+            print(f"[agent-bridge] {agent['id']}: broad code handoff; starting with budget {adjusted}", file=sys.stderr)
+            budget = adjusted
     while True:
         result = _invoke_target_once(
             agent,
@@ -1016,6 +1362,7 @@ def invoke_target(
             meta=meta,
             media_dirs=media_dirs,
             route_policy=route_policy,
+            limits=limits,
         )
         if result.return_code == 0:
             if budget_auto and not dry_run:
@@ -1031,7 +1378,17 @@ def invoke_target(
             return result.return_code
         if not budget_auto or dry_run or not is_budget_error(result.output):
             return result.return_code
-        retry_budget = next_budget(budget, max_auto_budget_usd)
+        retry_budget = incentive_budget(
+            budget,
+            max_auto_budget_usd,
+            result.progress,
+            (limits or DispatchLimits(
+                timeout_seconds=DEFAULT_DISPATCH_TIMEOUT_SECONDS,
+                idle_timeout_seconds=DEFAULT_IDLE_TIMEOUT_SECONDS,
+                poll_interval_seconds=DEFAULT_POLL_INTERVAL_SECONDS,
+                progress_bonus_usd=DEFAULT_PROGRESS_BONUS_USD,
+            )).progress_bonus_usd,
+        )
         if retry_budget is None:
             record_agent_connection(agent["id"], last_status="budget_failed", last_error="budget", calibrated_budget_usd=_format_budget(budget))
             print(
@@ -1040,13 +1397,25 @@ def invoke_target(
                 file=sys.stderr,
             )
             return result.return_code
+        event_type = "agent.progress_budget_retry" if result.progress and result.progress.get("promising") else "agent.budget_retry"
         emit_event(
-            "agent.budget_retry",
+            event_type,
             run_id=(meta or {}).get("run_id"),
             meta=meta or {},
-            data={"target": agent["id"], "from_budget_usd": _format_budget(budget), "to_budget_usd": retry_budget},
+            data={
+                "target": agent["id"],
+                "from_budget_usd": _format_budget(budget),
+                "to_budget_usd": retry_budget,
+                "progress": result.progress or {},
+            },
         )
-        print(f"[agent-bridge] {agent['id']}: budget {budget} was too low; retrying with {retry_budget}", file=sys.stderr)
+        if event_type == "agent.progress_budget_retry":
+            print(
+                f"[agent-bridge] {agent['id']}: promising progress before budget cap; retrying with {retry_budget}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"[agent-bridge] {agent['id']}: budget {budget} was too low; retrying with {retry_budget}", file=sys.stderr)
         budget = retry_budget
 
 
@@ -1070,6 +1439,35 @@ def parse_bridge_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--list", action="store_true", help="List configured agents and exit")
     parser.add_argument("--dry-run", action="store_true", help="Print target commands without invoking agents")
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=float(os.environ.get("AGENT_BRIDGE_DISPATCH_TIMEOUT_SECONDS", DEFAULT_DISPATCH_TIMEOUT_SECONDS)),
+        help="Maximum wall-clock seconds for a single target dispatch.",
+    )
+    parser.add_argument(
+        "--idle-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("AGENT_BRIDGE_IDLE_TIMEOUT_SECONDS", DEFAULT_IDLE_TIMEOUT_SECONDS)),
+        help="Maximum seconds without stdout or worktree progress before terminating a dispatch.",
+    )
+    parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=float(os.environ.get("AGENT_BRIDGE_POLL_INTERVAL_SECONDS", DEFAULT_POLL_INTERVAL_SECONDS)),
+        help="Seconds between worktree progress polls during a dispatch.",
+    )
+    parser.add_argument(
+        "--progress-bonus-usd",
+        default=os.environ.get("AGENT_BRIDGE_PROGRESS_BONUS_USD", DEFAULT_PROGRESS_BONUS_USD),
+        help="Budget increment awarded after promising progress before a budget-cap retry.",
+    )
+    parser.add_argument(
+        "--split-issues",
+        choices=["auto", "on", "off"],
+        default=os.environ.get("AGENT_BRIDGE_SPLIT_ISSUES", "auto"),
+        help="Split broad code-mode prompts with several #issue refs into ledger-backed slices.",
+    )
     parser.add_argument(
         "--route-policy",
         choices=["off", "no-route", "cache-first", "cheap-classifier", "standard", "premium"],
@@ -1100,8 +1498,15 @@ def bridge(argv: list[str]) -> int:
         raise BridgeError("a task prompt is required")
     if not args.targets:
         raise BridgeError("at least one target agent is required")
+    limits = DispatchLimits(
+        timeout_seconds=_positive_float(args.timeout_seconds, name="--timeout-seconds"),
+        idle_timeout_seconds=_positive_float(args.idle_timeout_seconds, name="--idle-timeout-seconds"),
+        poll_interval_seconds=_positive_float(args.poll_interval_seconds, name="--poll-interval-seconds"),
+        progress_bonus_usd=_format_budget(args.progress_bonus_usd),
+    )
     media = prepare_prompt_media(prompt, project_dir=PROJECT_DIR)
     prompt = media.prompt
+    issue_chunks = split_issue_prompts(prompt) if should_split_issue_handoff(prompt, mode, args.split_issues) else [("all", prompt)]
 
     targets = resolve_agent_ids(args.targets, agents)
     base_meta = ensure_run_meta(extract_meta(args))
@@ -1113,9 +1518,30 @@ def bridge(argv: list[str]) -> int:
         "run.created",
         run_id=base_meta.get("run_id"),
         meta=base_meta,
-        data={"command": "bridge", "source": source, "mode": mode, "targets": targets, "dry_run": args.dry_run},
+        data={
+            "command": "bridge",
+            "source": source,
+            "mode": mode,
+            "targets": targets,
+            "dry_run": args.dry_run,
+            "issue_slices": [key for key, _ in issue_chunks if key != "all"],
+            "limits": {
+                "timeout_seconds": limits.timeout_seconds,
+                "idle_timeout_seconds": limits.idle_timeout_seconds,
+                "poll_interval_seconds": limits.poll_interval_seconds,
+                "progress_bonus_usd": limits.progress_bonus_usd,
+            },
+        },
     )
-    record_run_task("created", meta=base_meta, command="bridge", data={"targets": targets, "mode": mode})
+    record_run_task("created", meta=base_meta, command="bridge", data={"targets": targets, "mode": mode, "issue_slices": [key for key, _ in issue_chunks if key != "all"]})
+    if len(issue_chunks) > 1:
+        print(f"[agent-bridge] split broad code handoff into {len(issue_chunks)} issue slices: {', '.join(key for key, _ in issue_chunks)}", file=sys.stderr)
+        emit_event(
+            "agent.handoff_split",
+            run_id=base_meta.get("run_id"),
+            meta=base_meta,
+            data={"issue_slices": [key for key, _ in issue_chunks], "reason": "broad_code_handoff"},
+        )
     if args.dry_run:
         media_suffixes = sorted({path.suffix for path in discover_prompt_heic_inputs(prompt, project_dir=PROJECT_DIR)})
         for target_id in targets:
@@ -1124,27 +1550,49 @@ def bridge(argv: list[str]) -> int:
                 print(f"[dry-run] incompatibility: {problem}")
     rc = 0
     for target_id in targets:
-        target_meta = child_turn_meta(
-            base_meta,
-            role=target_id,
-            attempt=int(base_meta.get("attempt", 1)),
-            parent_id=base_meta.get("parent_id"),
-        )
-        target_rc = invoke_target(
-            agents[target_id],
-            source=source,
-            mode=mode,
-            prompt=prompt,
-            budget_usd=str(args.budget_usd),
-            dry_run=args.dry_run,
-            meta=target_meta,
-            media_dirs=media.media_dirs,
-            budget_auto=not args.no_budget_auto,
-            max_auto_budget_usd=str(args.max_auto_budget_usd),
-            route_policy=args.route_policy,
-        )
-        if target_rc != 0:
-            rc = target_rc
+        for slice_index, (slice_key, slice_prompt) in enumerate(issue_chunks, start=1):
+            target_meta = child_turn_meta(
+                base_meta,
+                role=target_id,
+                attempt=int(base_meta.get("attempt", 1)),
+                parent_id=base_meta.get("parent_id"),
+            )
+            slice_data = {"target": target_id, "slice": slice_key, "slice_index": slice_index, "slice_count": len(issue_chunks)}
+            if slice_key != "all":
+                record_run_task("updated", meta=base_meta, command="bridge", data={"status": "slice_started", **slice_data})
+                emit_event("agent.slice_started", run_id=base_meta.get("run_id"), meta=target_meta, data=slice_data)
+            target_rc = invoke_target(
+                agents[target_id],
+                source=source,
+                mode=mode,
+                prompt=slice_prompt,
+                budget_usd=str(args.budget_usd),
+                dry_run=args.dry_run,
+                meta=target_meta,
+                media_dirs=media.media_dirs,
+                budget_auto=not args.no_budget_auto,
+                max_auto_budget_usd=str(args.max_auto_budget_usd),
+                route_policy=args.route_policy,
+                limits=limits,
+            )
+            if slice_key != "all":
+                record_run_task(
+                    "updated",
+                    meta=base_meta,
+                    command="bridge",
+                    data={"status": "slice_completed" if target_rc == 0 else "slice_failed", "return_code": target_rc, **slice_data},
+                )
+                emit_event(
+                    "agent.slice_completed" if target_rc == 0 else "agent.slice_failed",
+                    run_id=base_meta.get("run_id"),
+                    meta=target_meta,
+                    data={"return_code": target_rc, **slice_data},
+                )
+            if target_rc != 0:
+                rc = target_rc
+                break
+        if rc != 0:
+            break
     emit_event(
         "run.completed",
         run_id=base_meta.get("run_id"),
@@ -1235,8 +1683,12 @@ def shared_skills_root_candidates() -> list[Path]:
         value = os.environ.get(name)
         if value:
             candidates.append(Path(value) / "SharedAgentSkills")
+    cloud_root = home / "Library" / "CloudStorage"
+    if cloud_root.exists():
+        candidates.extend(sorted(path / "SharedAgentSkills" for path in cloud_root.glob("OneDrive-*")))
     candidates.extend(
         [
+            home / "Library" / "CloudStorage" / "OneDrive-nextcz.com" / "SharedAgentSkills",
             home / "Library" / "CloudStorage" / "OneDrive-Personal" / "SharedAgentSkills",
             home / "OneDrive" / "SharedAgentSkills",
         ]
@@ -1658,6 +2110,8 @@ Use the installed `agent` command as the front door for local and cross-harness 
 - Use `agent code bridge --mode code` only for scoped implementation tasks with an explicit worktree.
 - Use `agent code loop` for adversarial builder/critic/verifier loops; keep budgets explicit when cost matters.
 - Use mailbox MCP for async handoffs. Mailbox messages are the durable proof path; shell process lifetime is secondary.
+- Long bridge dispatches have wall-clock and idle-output limits. Tune with `--timeout-seconds`, `--idle-timeout-seconds`, and `--poll-interval-seconds`.
+- Broad code-mode prompts with several `#issue` refs split into issue-scoped slices by default; use `--split-issues off` to keep one synchronous handoff.
 
 ## Media Handling
 
@@ -1668,6 +2122,7 @@ Use the installed `agent` command as the front door for local and cross-harness 
 
 - Use `AGENT_BRIDGE_CLAUDE_EMAIL=<email> agent code repair --to claude` when a target CLI reports stale auth, 401 credentials, or budget calibration trouble.
 - Bridge and loop dispatches retry `Exceeded USD budget (...)` failures automatically up to `AGENT_BRIDGE_MAX_AUTO_BUDGET_USD` or `--max-auto-budget-usd`, then persist the working cap under `{CONNECTION_STATE}`.
+- If a target shows promising progress before a budget cap, bridge may award `--progress-bonus-usd` on the next retry, still bounded by `--max-auto-budget-usd`.
 - Use `--no-budget-auto` on bridge or loop calls when an explicit hard budget should fail instead of retrying.
 
 ## Shared Registry
@@ -1678,7 +2133,7 @@ Treat a fresh registry row as "this harness has recently started or resumed and 
 
 ## Path Rules
 
-- Resolve the shared skill root with `AGENT_BRIDGE_SHARED_SKILLS_ROOT`, then `SHARED_AGENT_SKILLS_ROOT`, then the platform OneDrive defaults.
+- Resolve the shared skill root with `AGENT_BRIDGE_SHARED_SKILLS_ROOT`, then `SHARED_AGENT_SKILLS_ROOT`, then macOS/Windows OneDrive `SharedAgentSkills` defaults, including `~/Library/CloudStorage/OneDrive-*`.
 - macOS default bridge repo: `~/Code/agent-bridge`
 - Windows default bridge repo: `%USERPROFILE%\\Code\\agent-bridge`
 - MCP mailbox registrations should point to `agent_bridge/mailbox_mcp.py` in the global bridge repo, not a project-local copy.

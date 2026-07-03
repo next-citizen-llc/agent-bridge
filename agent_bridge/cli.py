@@ -1132,7 +1132,8 @@ def _comma_values(values: list[str] | None) -> list[str]:
 
 
 def _hook_agent_command(client: str) -> str:
-    agent_bin = os.environ.get("AGENT_BRIDGE_HOOK_AGENT", "/Users/tts/.local/bin/agent")
+    default_agent = str(Path.home() / ".local" / "bin" / "agent")
+    agent_bin = os.environ.get("AGENT_BRIDGE_HOOK_AGENT", default_agent)
     if agent_bin.lower().endswith((".cmd", ".bat")) or "\\" in agent_bin:
         return f'cmd /d /c ""{agent_bin}" code hook session-start --client {client}"'
     return f"'{agent_bin}' code hook session-start --client {client}"
@@ -1172,14 +1173,13 @@ def shared_skills_root_candidates() -> list[Path]:
         value = os.environ.get(name)
         if value:
             candidates.append(Path(value) / "SharedAgentSkills")
-    candidates.extend(
-        [
-            home / "Library" / "CloudStorage" / "OneDrive-nextcz.com" / "SharedAgentSkills",
-            home / "Library" / "CloudStorage" / "OneDrive-Personal" / "SharedAgentSkills",
-            home / "OneDrive - Next Cz" / "SharedAgentSkills",
-            home / "OneDrive" / "SharedAgentSkills",
-        ]
-    )
+    cloud_storage = home / "Library" / "CloudStorage"
+    if cloud_storage.is_dir():
+        candidates.extend(
+            sorted(entry / "SharedAgentSkills" for entry in cloud_storage.glob("OneDrive-*"))
+        )
+    candidates.extend(sorted(home.glob("OneDrive - */SharedAgentSkills")))
+    candidates.append(home / "OneDrive" / "SharedAgentSkills")
     return _dedupe_paths(candidates)
 
 
@@ -1696,7 +1696,7 @@ Treat a fresh registry row as "this harness has recently started or resumed and 
 ## Path Rules
 
 - Resolve the shared skill root with `AGENT_BRIDGE_SHARED_SKILLS_ROOT`, then `SHARED_AGENT_SKILLS_ROOT`, then the platform OneDrive defaults.
-- macOS default bridge repo: `/Users/tts/Code/agent-bridge`
+- macOS default bridge repo: `~/Code/agent-bridge`
 - Windows default bridge repo: `%USERPROFILE%\\Code\\agent-bridge`
 - MCP mailbox registrations should point to `agent_bridge/mailbox_mcp.py` in the global bridge repo, not a project-local copy.
 """

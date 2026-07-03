@@ -15,14 +15,14 @@ existing UI sessions.
 ## Install
 
 ```bash
-cd /Users/tts/Code/agent-bridge
+cd ~/Code/agent-bridge
 scripts/install.sh
 ```
 
 That creates:
 
 ```text
-~/.local/bin/agent -> /Users/tts/Code/agent-bridge/bin/agent
+~/.local/bin/agent -> ~/Code/agent-bridge/bin/agent
 ```
 
 `~/.local/bin` must be on `PATH`.
@@ -50,19 +50,19 @@ The installer adds `%USERPROFILE%\.local\bin` to the user `PATH` unless you pass
 Register the mailbox globally in Claude Code:
 
 ```bash
-claude mcp add --scope user mailbox -- python3 /Users/tts/Code/agent-bridge/agent_bridge/mailbox_mcp.py
+claude mcp add --scope user mailbox -- python3 ~/Code/agent-bridge/agent_bridge/mailbox_mcp.py
 ```
 
 Register the mailbox globally in Codex:
 
 ```bash
-codex mcp add mailbox -- python3 /Users/tts/Code/agent-bridge/agent_bridge/mailbox_mcp.py
+codex mcp add mailbox -- python3 ~/Code/agent-bridge/agent_bridge/mailbox_mcp.py
 ```
 
 Register the mailbox in Gemini CLI (run per workspace or from home; Gemini stores MCP in its config):
 
 ```bash
-gemini mcp add mailbox python3 /Users/tts/Code/agent-bridge/agent_bridge/mailbox_mcp.py
+gemini mcp add mailbox python3 ~/Code/agent-bridge/agent_bridge/mailbox_mcp.py
 ```
 
 The mailbox tools are:
@@ -121,17 +121,17 @@ skill folders are legacy registration/sync context.
 Inspect and validate the vault:
 
 ```bash
-agent code skills inventory --repo /Users/tts/Code/skills-vault
-agent code skills validate --repo /Users/tts/Code/skills-vault
-agent code skills status --repo /Users/tts/Code/skills-vault --client all
+agent code skills inventory --repo ~/Code/skills-vault
+agent code skills validate --repo ~/Code/skills-vault
+agent code skills status --repo ~/Code/skills-vault --client all
 ```
 
 Install active skills into local harness roots. Existing symlinks are relinked to the vault;
 real directories are left unchanged and reported as conflicts:
 
 ```bash
-agent code skills install --repo /Users/tts/Code/skills-vault --client all
-agent code skills sync --repo /Users/tts/Code/skills-vault --ff-only --install --client all
+agent code skills install --repo ~/Code/skills-vault --client all
+agent code skills sync --repo ~/Code/skills-vault --ff-only --install --client all
 ```
 
 On Windows, `.\scripts\install.ps1` runs the same hook installer automatically. To also attempt

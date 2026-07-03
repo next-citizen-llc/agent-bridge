@@ -13,9 +13,9 @@ Implements just enough of MCP (JSON-RPC 2.0 over newline-delimited stdio):
 Tools: mailbox_send, mailbox_inbox, mailbox_read.
 
 Register with Codex:
-  codex mcp add mailbox -- python3 /Users/tts/Code/agent-bridge/agent_bridge/mailbox_mcp.py
+  codex mcp add mailbox -- python3 ~/Code/agent-bridge/agent_bridge/mailbox_mcp.py
 Register with Claude Code globally:
-  claude mcp add --scope user mailbox -- python3 /Users/tts/Code/agent-bridge/agent_bridge/mailbox_mcp.py
+  claude mcp add --scope user mailbox -- python3 ~/Code/agent-bridge/agent_bridge/mailbox_mcp.py
 (Desktop apps need a restart / their own MCP settings to load it.)
 
 Global local dev tooling. Mailbox state is stored under ~/.local/state/agent-bridge/.

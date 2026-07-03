@@ -15,14 +15,14 @@ existing UI sessions.
 ## Install
 
 ```bash
-cd ~/Code/agent-bridge
+cd /Users/tts/Code/agent-bridge
 scripts/install.sh
 ```
 
 That creates:
 
 ```text
-~/.local/bin/agent -> ~/Code/agent-bridge/bin/agent
+~/.local/bin/agent -> /Users/tts/Code/agent-bridge/bin/agent
 ```
 
 `~/.local/bin` must be on `PATH`.
@@ -50,13 +50,19 @@ The installer adds `%USERPROFILE%\.local\bin` to the user `PATH` unless you pass
 Register the mailbox globally in Claude Code:
 
 ```bash
-claude mcp add --scope user mailbox -- python3 ~/Code/agent-bridge/agent_bridge/mailbox_mcp.py
+claude mcp add --scope user mailbox -- python3 /Users/tts/Code/agent-bridge/agent_bridge/mailbox_mcp.py
 ```
 
 Register the mailbox globally in Codex:
 
 ```bash
-codex mcp add mailbox -- python3 ~/Code/agent-bridge/agent_bridge/mailbox_mcp.py
+codex mcp add mailbox -- python3 /Users/tts/Code/agent-bridge/agent_bridge/mailbox_mcp.py
+```
+
+Register the mailbox in Gemini CLI (run per workspace or from home; Gemini stores MCP in its config):
+
+```bash
+gemini mcp add mailbox python3 /Users/tts/Code/agent-bridge/agent_bridge/mailbox_mcp.py
 ```
 
 The mailbox tools are:
@@ -73,7 +79,7 @@ The mailbox tools are:
 
 ## Configure Session Hooks
 
-Install lightweight SessionStart hooks for both Codex and Claude:
+Install lightweight SessionStart hooks for Codex, Claude, and Gemini:
 
 ```bash
 agent code hooks install --client both
@@ -91,11 +97,41 @@ Check hook status:
 agent code hooks status --client both
 ```
 
+SessionStart hooks publish cached readiness only. They do not run Claude login,
+spawn model probes, or try to repair credentials. Use the explicit auth preflight
+when you need to verify headless Claude readiness:
+
+```bash
+agent code auth preflight --to claude --refresh
+agent code auth status --to claude
+```
+
 Install or refresh the shared Agent Bridge skill package and link it into local harness skill
 roots:
 
 ```bash
 agent code harness install-skill
+```
+
+## Git-Backed Skills Vault
+
+The private `skills-vault` repo is the canonical source for user-authored skills. OneDrive
+skill folders are legacy registration/sync context.
+
+Inspect and validate the vault:
+
+```bash
+agent code skills inventory --repo /Users/tts/Code/skills-vault
+agent code skills validate --repo /Users/tts/Code/skills-vault
+agent code skills status --repo /Users/tts/Code/skills-vault --client all
+```
+
+Install active skills into local harness roots. Existing symlinks are relinked to the vault;
+real directories are left unchanged and reported as conflicts:
+
+```bash
+agent code skills install --repo /Users/tts/Code/skills-vault --client all
+agent code skills sync --repo /Users/tts/Code/skills-vault --ff-only --install --client all
 ```
 
 On Windows, `.\scripts\install.ps1` runs the same hook installer automatically. To also attempt
@@ -115,6 +151,9 @@ agent code bridge --from human --to claude --mode review \
 
 agent code bridge --from human --to codex --mode code \
   --prompt "Implement the scoped change and run focused tests."
+
+agent code bridge --from human --to gemini --mode code \
+  --prompt "Implement the change using Gemini."
 ```
 
 The bridge targets the current git root by default. Use `--project-dir` to target a different
@@ -259,7 +298,7 @@ export AGENT_BRIDGE_STATE_DIR=/path/to/state
 
 ## Safety
 
-- No live production actions, credential use, deploys, teardowns, or direct GitHub pushes.
+- No live Domino actions, credential use, deploys, teardowns, or direct GitHub pushes.
 - `review` mode is analysis-only.
 - `code` mode may edit local files in the target worktree; review diffs before committing.
 - Keep public branch names, PR titles, and repo-visible artifacts neutral and logical. Do not

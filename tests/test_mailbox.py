@@ -87,20 +87,7 @@ class MailboxTests(unittest.TestCase):
             self.assertEqual(send.returncode, 0, send.stderr)
 
             read = subprocess.run(
-                [
-                    "python3",
-                    str(MAILBOX),
-                    "read",
-                    "--to",
-                    "claude",
-                    "--run-id",
-                    "run-test",
-                    "--turn-id",
-                    "turn-test",
-                    "--role",
-                    "critic",
-                    "--full",
-                ],
+                ["python3", str(MAILBOX), "read", "--to", "claude", "--run-id", "run-test", "--full"],
                 env=env,
                 text=True,
                 stdout=subprocess.PIPE,

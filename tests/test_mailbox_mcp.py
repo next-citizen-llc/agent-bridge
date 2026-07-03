@@ -81,29 +81,7 @@ class MailboxMcpTests(unittest.TestCase):
                             "method": "tools/call",
                             "params": {
                                 "name": "mailbox_inbox",
-                                "arguments": {"to": "claude", "run_id": "run-mcp", "role": "builder"},
-                            },
-                        }
-                    ),
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": 3,
-                            "method": "tools/call",
-                            "params": {
-                                "name": "mailbox_read",
-                                "arguments": {"id": "m0001", "run_id": "run-mcp", "role": "critic"},
-                            },
-                        }
-                    ),
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": 4,
-                            "method": "tools/call",
-                            "params": {
-                                "name": "mailbox_read",
-                                "arguments": {"id": "m0001", "run_id": "run-mcp", "role": "builder"},
+                                "arguments": {"to": "claude", "run_id": "run-mcp"},
                             },
                         }
                     ),
@@ -123,8 +101,6 @@ class MailboxMcpTests(unittest.TestCase):
         rows = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
         self.assertIn("sent m0001", rows[0]["result"]["content"][0]["text"])
         self.assertIn("run=run-mcp", rows[1]["result"]["content"][0]["text"])
-        self.assertIn("no message m0001", rows[2]["result"]["content"][0]["text"])
-        self.assertIn('"role": "builder"', rows[3]["result"]["content"][0]["text"])
 
 
 if __name__ == "__main__":

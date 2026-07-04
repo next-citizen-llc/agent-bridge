@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/codex-sidebar-sync.sh export --out DIR [--codex-home DIR]
+  scripts/codex-sidebar-sync.sh import --from DIR --yes [--codex-home DIR] [--refresh-sidebar] [--restart]
+
+Copies the Codex Desktop state that drives sessions and sidebar workspaces.
+
+Export should run on the source machine. Import should run on the target machine
+after the bundle is available locally through a synced folder, rsync, or scp.
+
+Options:
+  --codex-home DIR      Codex home directory. Defaults to CODEX_HOME or ~/.codex.
+  --out DIR             Destination bundle directory for export.
+  --from DIR            Source bundle directory for import.
+  --yes                 Required for import because target state is overwritten.
+  --refresh-sidebar     Validate imported state and write a refresh marker.
+  --restart             Quit Codex.app before import and reopen it afterward.
+  -h, --help            Show this help.
+EOF
+}
+
+die() {
+  printf 'codex-sidebar-sync: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+timestamp() {
+  date -u +%Y%m%dT%H%M%SZ
+}
+
+default_codex_home() {
+  printf '%s\n' "${CODEX_HOME:-$HOME/.codex}"
+}
+
+copy_file_if_exists() {
+  local src="$1"
+  local dst="$2"
+  if [[ -f "$src" ]]; then
+    mkdir -p "$(dirname "$dst")"
+    cp -p "$src" "$dst"
+  fi
+}
+
+copy_dir_if_exists() {
+  local src="$1"
+  local dst="$2"
+  if [[ -d "$src" ]]; then
+    mkdir -p "$dst"
+    rsync -a --delete "$src"/ "$dst"/
+  fi
+}
+
+backup_sqlite_if_exists() {
+  local src="$1"
+  local dst="$2"
+  if [[ -f "$src" ]]; then
+    mkdir -p "$(dirname "$dst")"
+    sqlite3 "$src" ".backup '$dst'"
+  fi
+}
+
+write_manifest() {
+  local bundle="$1"
+  local codex_home="$2"
+  local mode="$3"
+  cat >"$bundle/manifest.json" <<EOF
+{
+  "schema_version": "1.0",
+  "kind": "codex_sidebar_state_bundle",
+  "mode": "$mode",
+  "created_at": "$(timestamp)",
+  "hostname": "$(hostname)",
+  "source_codex_home": "$codex_home"
+}
+EOF
+}
+
+export_bundle() {
+  local codex_home="$1"
+  local out="$2"
+  need_cmd rsync
+  need_cmd sqlite3
+  [[ -d "$codex_home" ]] || die "Codex home not found: $codex_home"
+  mkdir -p "$out"
+
+  copy_file_if_exists "$codex_home/.codex-global-state.json" "$out/.codex-global-state.json"
+  copy_file_if_exists "$codex_home/session_index.jsonl" "$out/session_index.jsonl"
+  copy_file_if_exists "$codex_home/external_agent_session_imports.json" "$out/external_agent_session_imports.json"
+  copy_file_if_exists "$codex_home/config.toml" "$out/config.toml"
+
+  backup_sqlite_if_exists "$codex_home/state_5.sqlite" "$out/state_5.sqlite"
+  backup_sqlite_if_exists "$codex_home/sqlite/state_5.sqlite" "$out/sqlite/state_5.sqlite"
+  backup_sqlite_if_exists "$codex_home/logs_2.sqlite" "$out/logs_2.sqlite"
+  backup_sqlite_if_exists "$codex_home/memories_1.sqlite" "$out/memories_1.sqlite"
+  backup_sqlite_if_exists "$codex_home/goals_1.sqlite" "$out/goals_1.sqlite"
+
+  copy_dir_if_exists "$codex_home/sessions" "$out/sessions"
+  copy_dir_if_exists "$codex_home/archived_sessions" "$out/archived_sessions"
+  copy_dir_if_exists "$codex_home/ambient-suggestions" "$out/ambient-suggestions"
+  copy_dir_if_exists "$codex_home/attachments" "$out/attachments"
+  copy_dir_if_exists "$codex_home/generated_images" "$out/generated_images"
+
+  write_manifest "$out" "$codex_home" "export"
+  printf 'Exported Codex sidebar/session bundle: %s\n' "$out"
+}
+
+backup_target() {
+  local codex_home="$1"
+  local backup_dir="$codex_home/backups/sidebar-state-sync-$(timestamp)"
+  mkdir -p "$backup_dir"
+  export_bundle "$codex_home" "$backup_dir" >/dev/null
+  printf '%s\n' "$backup_dir"
+}
+
+restore_sqlite_if_exists() {
+  local src="$1"
+  local dst="$2"
+  if [[ -f "$src" ]]; then
+    mkdir -p "$(dirname "$dst")"
+    cp -p "$src" "$dst"
+  fi
+}
+
+refresh_sidebar_state() {
+  local codex_home="$1"
+  local marker_dir="$codex_home/backups/sidebar-state-sync-refresh"
+  mkdir -p "$marker_dir"
+  if [[ -f "$codex_home/state_5.sqlite" ]]; then
+    local check
+    check="$(sqlite3 "$codex_home/state_5.sqlite" 'pragma integrity_check;')"
+    [[ "$check" == "ok" ]] || die "state_5.sqlite integrity check failed: $check"
+  fi
+  printf '{"refreshed_at":"%s","note":"Restart Codex Desktop to reload sidebar state."}\n' "$(timestamp)" \
+    >"$marker_dir/last-refresh.json"
+  printf 'Refreshed on-disk sidebar state and wrote marker: %s\n' "$marker_dir/last-refresh.json"
+}
+
+quit_codex() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    printf 'Codex.app automatic quit is only implemented for macOS.\n' >&2
+    return 0
+  fi
+  /usr/bin/osascript -e 'tell application "Codex" to quit' >/dev/null 2>&1 || true
+  sleep 2
+}
+
+open_codex() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    printf 'Restart requested, but automatic Codex.app open is only implemented for macOS.\n' >&2
+    return 0
+  fi
+  /usr/bin/open -a Codex
+  printf 'Opened Codex.app\n'
+}
+
+import_bundle() {
+  local codex_home="$1"
+  local from="$2"
+  local refresh="$3"
+  local restart="$4"
+  need_cmd rsync
+  need_cmd sqlite3
+  [[ -d "$from" ]] || die "bundle directory not found: $from"
+  [[ -f "$from/manifest.json" ]] || die "bundle manifest not found: $from/manifest.json"
+  mkdir -p "$codex_home"
+  if [[ "$restart" == "1" ]]; then
+    quit_codex
+  fi
+
+  local backup_dir
+  backup_dir="$(backup_target "$codex_home")"
+
+  copy_file_if_exists "$from/.codex-global-state.json" "$codex_home/.codex-global-state.json"
+  copy_file_if_exists "$from/session_index.jsonl" "$codex_home/session_index.jsonl"
+  copy_file_if_exists "$from/external_agent_session_imports.json" "$codex_home/external_agent_session_imports.json"
+  copy_file_if_exists "$from/config.toml" "$codex_home/config.toml"
+
+  restore_sqlite_if_exists "$from/state_5.sqlite" "$codex_home/state_5.sqlite"
+  restore_sqlite_if_exists "$from/sqlite/state_5.sqlite" "$codex_home/sqlite/state_5.sqlite"
+  restore_sqlite_if_exists "$from/logs_2.sqlite" "$codex_home/logs_2.sqlite"
+  restore_sqlite_if_exists "$from/memories_1.sqlite" "$codex_home/memories_1.sqlite"
+  restore_sqlite_if_exists "$from/goals_1.sqlite" "$codex_home/goals_1.sqlite"
+
+  copy_dir_if_exists "$from/sessions" "$codex_home/sessions"
+  copy_dir_if_exists "$from/archived_sessions" "$codex_home/archived_sessions"
+  copy_dir_if_exists "$from/ambient-suggestions" "$codex_home/ambient-suggestions"
+  copy_dir_if_exists "$from/attachments" "$codex_home/attachments"
+  copy_dir_if_exists "$from/generated_images" "$codex_home/generated_images"
+
+  printf 'Imported Codex sidebar/session bundle from: %s\n' "$from"
+  printf 'Target backup saved at: %s\n' "$backup_dir"
+
+  if [[ "$refresh" == "1" ]]; then
+    refresh_sidebar_state "$codex_home"
+  fi
+  if [[ "$restart" == "1" ]]; then
+    open_codex
+  fi
+}
+
+mode="${1:-}"
+[[ -n "$mode" ]] || { usage; exit 2; }
+shift || true
+
+codex_home="$(default_codex_home)"
+out=""
+from=""
+yes="0"
+refresh="0"
+restart="0"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --codex-home)
+      codex_home="${2:-}"
+      [[ -n "$codex_home" ]] || die "--codex-home requires a value"
+      shift 2
+      ;;
+    --out)
+      out="${2:-}"
+      [[ -n "$out" ]] || die "--out requires a value"
+      shift 2
+      ;;
+    --from)
+      from="${2:-}"
+      [[ -n "$from" ]] || die "--from requires a value"
+      shift 2
+      ;;
+    --yes)
+      yes="1"
+      shift
+      ;;
+    --refresh-sidebar)
+      refresh="1"
+      shift
+      ;;
+    --restart)
+      restart="1"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+codex_home="${codex_home/#\~/$HOME}"
+if [[ "$codex_home" != /* ]]; then
+  codex_home="$(pwd)/$codex_home"
+fi
+codex_home="${codex_home%/}"
+
+case "$mode" in
+  export)
+    [[ -n "$out" ]] || die "export requires --out DIR"
+    export_bundle "$codex_home" "$out"
+    ;;
+  import)
+    [[ -n "$from" ]] || die "import requires --from DIR"
+    [[ "$yes" == "1" ]] || die "import overwrites target state; pass --yes after reviewing the bundle"
+    import_bundle "$codex_home" "$from" "$refresh" "$restart"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    die "unknown mode: $mode"
+    ;;
+esac

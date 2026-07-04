@@ -260,6 +260,9 @@ SharedAgentSkills/
 Root discovery checks `AGENT_BRIDGE_SHARED_SKILLS_ROOT`, `SHARED_AGENT_SKILLS_ROOT`,
 `CAREER_SHARED_SKILLS_ROOT`, OneDrive environment variables, then the platform defaults.
 
+To copy Codex Desktop sessions and sidebar workspaces between machines, use
+[`docs/codex-sidebar-state-sync.md`](docs/codex-sidebar-state-sync.md).
+
 Override with:
 
 ```bash

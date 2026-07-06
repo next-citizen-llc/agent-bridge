@@ -263,6 +263,10 @@ Root discovery checks `AGENT_BRIDGE_SHARED_SKILLS_ROOT`, `SHARED_AGENT_SKILLS_RO
 To copy Codex Desktop sessions and sidebar workspaces between machines, use
 [`docs/codex-sidebar-state-sync.md`](docs/codex-sidebar-state-sync.md).
 
+For the proposed always-on light sync layer across harness start/exit, active work,
+and idle OS scheduler runs, see
+[`docs/design/always-on-state-sync.md`](docs/design/always-on-state-sync.md).
+
 Override with:
 
 ```bash

@@ -49,6 +49,8 @@ or machine-specific settings may need adjustment on the target.
 Pick a synced location both machines can read, for example a shared OneDrive
 folder:
 
+macOS/Linux:
+
 ```bash
 SYNC_ROOT="$HOME/Library/CloudStorage/OneDrive-nextcz.com/SharedAgentData/CodexSidebarSync"
 BUNDLE="$SYNC_ROOT/$(hostname)-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -57,12 +59,24 @@ cd /Users/tts/Code/agent-bridge
 scripts/codex-sidebar-sync.sh export --out "$BUNDLE"
 ```
 
+Windows PowerShell:
+
+```powershell
+$SyncRoot = Join-Path $env:OneDrive "SharedAgentData\CodexSidebarSync"
+$Bundle = Join-Path $SyncRoot ("$env:COMPUTERNAME-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ"))
+
+cd "$HOME\Code\agent-bridge"
+.\scripts\codex-sidebar-sync.ps1 export -Out $Bundle
+```
+
 The export uses SQLite `.backup` for live databases rather than raw-copying
 WAL-backed files.
 
 ## Target Machine: Import, Refresh, Restart
 
 After the bundle is visible on the target machine:
+
+macOS target:
 
 ```bash
 BUNDLE="/path/to/CodexSidebarSync/<source-host>-<timestamp>"
@@ -75,12 +89,41 @@ scripts/codex-sidebar-sync.sh import \
   --restart
 ```
 
+Windows target:
+
+```powershell
+$Bundle = "$env:OneDrive\SharedAgentData\CodexSidebarSync\<source-host>-<timestamp>"
+
+cd "$HOME\Code\agent-bridge"
+.\scripts\codex-sidebar-sync.ps1 import `
+  -From $Bundle `
+  -Yes `
+  -RefreshSidebar `
+  -Restart
+```
+
 `--refresh-sidebar` validates `state_5.sqlite` with `pragma integrity_check` and
 writes a refresh marker under `~/.codex/backups/sidebar-state-sync-refresh/`.
 
 `--restart` quits `Codex.app` on macOS before import, then reopens it after the
-copied state is in place. On other platforms, quit Codex Desktop before import
-and restart it manually afterward.
+copied state is in place. On Windows, `-Restart` stops a running `Codex` process
+before import and starts `Codex.exe` afterward when it can resolve the install
+path; if it cannot, start Codex Desktop manually after the import.
+
+## Common Directional Flows
+
+To push this Mac's Codex conversations and workspaces to the Windows Desktop:
+
+1. Export on the Mac into `SharedAgentData/CodexSidebarSync`.
+2. Wait for OneDrive to finish syncing the bundle to Windows.
+3. On `DESKTOP-785F6GB`, import that bundle with the Windows target command.
+
+To pull the Windows Desktop's Codex conversations and workspaces back to this
+Mac:
+
+1. Export on `DESKTOP-785F6GB` with the Windows source command.
+2. Wait for OneDrive to finish syncing the bundle to this Mac.
+3. Import that bundle on the Mac with the macOS target command.
 
 ## Target Backup and Rollback
 

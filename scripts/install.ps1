@@ -42,7 +42,7 @@ if (-not $SkipPathUpdate) {
 
 if (-not $SkipHooks) {
     $env:AGENT_BRIDGE_HOOK_AGENT = $AgentCmd
-    & $AgentCmd code hooks install --client both
+    & $AgentCmd code hooks install --client all
     Remove-Item Env:\AGENT_BRIDGE_HOOK_AGENT -ErrorAction SilentlyContinue
 }
 
@@ -77,4 +77,4 @@ if ($RegisterMcp) {
 
 Write-Host "Installed agent command: $AgentCmd"
 Write-Host "State directory: $StateDir"
-Write-Host "Run: agent code hooks status --client both"
+Write-Host "Run: agent code hooks status --client all"

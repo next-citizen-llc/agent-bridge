@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nextcz.com/schemas/agent-bridge-readiness-1.0.json",
+  "title": "Agent Bridge readiness report",
+  "type": "object",
+  "required": ["schema_version", "kind", "scope", "generated_at", "expires_at", "machine_id", "client", "surface", "project_dir", "overall", "checks", "shared_roots"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "kind": {"const": "agent-bridge.readiness"},
+    "scope": {"enum": ["session", "work"]},
+    "overall": {"enum": ["ready", "degraded", "blocked", "unknown"]},
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status", "required", "error_class", "detail", "repair_command"]
+      }
+    }
+  }
+}

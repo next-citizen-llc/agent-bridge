@@ -80,6 +80,7 @@ class AgentConfigTests(unittest.TestCase):
         self.assertIn("--permission-mode auto", proc.stdout)
         self.assertIn("--output-format plain", proc.stdout)
         self.assertIn("--disable-web-search", proc.stdout)
+        self.assertIn("--max-turns 16", proc.stdout)
 
     def test_agy_dry_run_renders_review_and_code_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

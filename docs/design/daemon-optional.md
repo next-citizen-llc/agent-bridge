@@ -25,6 +25,10 @@ primitives above. If a daemon is ever added, the same command reports its livene
 JSON shape (`daemon_optional: true`) is the compatibility contract, and all CLI flows
 must keep working when the daemon is absent.
 
+For cross-machine harness freshness, prefer the one-shot state-sync worker design in
+[`always-on-state-sync.md`](always-on-state-sync.md): hooks, active periodic sync, and
+OS schedulers can all call the same idempotent CLI without making a daemon mandatory.
+
 ## Non-goals
 
 No hosted service, no sockets, no background process installed by default, and no

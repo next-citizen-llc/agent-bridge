@@ -1,0 +1,95 @@
+{
+  "schema_version": "1.0",
+  "surfaces": [
+    {
+      "client": "codex",
+      "surface": "cli",
+      "startup_mechanism": "native-session-hook",
+      "config_path": "~/.codex/hooks.json",
+      "registration_command": "agent code hook session-start --client codex --surface cli --startup-mechanism native-session-hook",
+      "verification_method": "native hook config plus fresh shared registry row",
+      "installable": true
+    },
+    {
+      "client": "codex",
+      "surface": "gui",
+      "startup_mechanism": "native-session-hook",
+      "config_path": "~/.codex/hooks.json",
+      "registration_command": "agent code hook session-start --client codex --surface gui --startup-mechanism native-session-hook",
+      "verification_method": "native hook config plus surface-specific shared registry row",
+      "installable": true
+    },
+    {
+      "client": "claude",
+      "surface": "cli",
+      "startup_mechanism": "native-session-hook",
+      "config_path": "~/.claude/settings.json",
+      "registration_command": "agent code hook session-start --client claude --surface cli --startup-mechanism native-session-hook",
+      "verification_method": "native hook config plus fresh shared registry row",
+      "installable": true,
+      "enabled_by_default": false
+    },
+    {
+      "client": "claude",
+      "surface": "gui",
+      "startup_mechanism": "wrapper-required",
+      "config_path": "~/.local/bin/claude-gui-bridge",
+      "registration_command": "claude-gui-bridge",
+      "verification_method": "exact wrapper content plus surface-specific shared registry row",
+      "installable": true,
+      "enabled_by_default": false,
+      "wrapper_app": "Claude",
+      "note": "Claude Desktop/Cowork does not share the verified Claude Code lifecycle; this wrapper registers the GUI surface before opening the app."
+    },
+    {
+      "client": "grok",
+      "surface": "cli",
+      "startup_mechanism": "native-session-hook",
+      "config_path": "~/.grok/hooks/agent-bridge.json",
+      "registration_command": "agent code hook session-start --client grok --surface cli --startup-mechanism native-session-hook",
+      "verification_method": "native hook config plus fresh shared registry row",
+      "installable": true
+    },
+    {
+      "client": "grok",
+      "surface": "gui",
+      "startup_mechanism": "wrapper-required",
+      "config_path": "~/.local/bin/grok-gui-bridge",
+      "registration_command": "grok-gui-bridge",
+      "verification_method": "exact Edge wrapper content plus surface-specific shared registry row",
+      "installable": true,
+      "wrapper_target": "https://grok.com/",
+      "note": "The wrapper registers the GUI surface, then opens Grok in Microsoft Edge."
+    },
+    {
+      "client": "agy",
+      "surface": "cli",
+      "startup_mechanism": "wrapper-required",
+      "config_path": "~/.local/bin/agy-bridge",
+      "registration_command": "agy-bridge",
+      "verification_method": "exact wrapper content plus fresh shared registry row",
+      "installable": true,
+      "note": "Use `agy-bridge` to register the surface before starting AGY."
+    },
+    {
+      "client": "agy",
+      "surface": "gui",
+      "startup_mechanism": "unsupported",
+      "config_path": "",
+      "registration_command": "",
+      "verification_method": "unsupported until a verified lifecycle hook exists",
+      "installable": false,
+      "note": "No verified native GUI startup hook is currently available."
+    },
+    {
+      "client": "ollama",
+      "surface": "local-api",
+      "startup_mechanism": "service-probe",
+      "config_path": "~/.local/bin/ollama-bridge",
+      "registration_command": "ollama-bridge",
+      "verification_method": "exact wrapper content plus local-api shared registry row",
+      "installable": true,
+      "note": "Use `ollama-bridge` when starting the service or CLI so registration precedes the original command."
+    }
+  ]
+}

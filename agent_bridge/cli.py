@@ -27,6 +27,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -42,6 +43,7 @@ from .coord import (
     run_doctor,
     set_trace_context,
 )
+from .context_adapters import ContextAdapterError, context_status, install_context_adapters
 from .correlation import add_meta_args, child_turn_meta, ensure_run_meta, extract_meta, format_meta, iso_now, safe_fragment, utc_stamp
 from .findings import (
     create_finding,
@@ -72,6 +74,16 @@ from .optimization import (
     tool_cache_path,
     write_usage,
 )
+from .readiness import (
+    aggregate_readiness,
+    configure_readiness,
+    configure_shared_roots,
+    flush_readiness_queue,
+    load_cached_preflight,
+    publish_readiness,
+    resolve_shared_roots,
+    run_preflight,
+)
 from .trace import emit_event, events_path, format_events, load_events
 from .workflow import (
     WorkflowError,
@@ -87,6 +99,7 @@ from .workflow import (
 
 BRIDGE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BRIDGE_DIR / "agents.json"
+SURFACES_CONFIG = BRIDGE_DIR / "surfaces.json"
 STATE_DIR = Path(os.environ.get("AGENT_BRIDGE_STATE_DIR", Path.home() / ".local/state/agent-bridge")).expanduser()
 TRANSCRIPT_DIR = STATE_DIR / "transcripts"
 BRIDGE_LOG = STATE_DIR / "bridge_agents.log"
@@ -371,7 +384,13 @@ def is_budget_error(output: str) -> bool:
 
 def is_auth_error(output: str) -> bool:
     lowered = output.lower()
-    return "failed to authenticate" in lowered or "invalid authentication credentials" in lowered or "401" in lowered
+    return (
+        "failed to authenticate" in lowered
+        or "invalid authentication credentials" in lowered
+        or "not logged in" in lowered
+        or "please run /login" in lowered
+        or "401" in lowered
+    )
 
 
 def _iter_prompt_heic_candidates(prompt: str) -> list[str]:
@@ -1070,6 +1089,10 @@ def parse_bridge_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--list", action="store_true", help="List configured agents and exit")
     parser.add_argument("--dry-run", action="store_true", help="Print target commands without invoking agents")
+    parser.add_argument("--no-preflight", action="store_true", help="Skip the default authenticated work-readiness gate for code mode")
+    parser.add_argument("--require-ready", action="store_true", help="Require a fully ready report, including advisory probes")
+    parser.add_argument("--refresh-readiness", action="store_true", help="Refresh readiness instead of using a fresh cache")
+    parser.add_argument("--preflight-timeout", type=int, default=20, help="Maximum seconds for each readiness probe")
     parser.add_argument(
         "--route-policy",
         choices=["off", "no-route", "cache-first", "cheap-classifier", "standard", "premium"],
@@ -1116,6 +1139,21 @@ def bridge(argv: list[str]) -> int:
         data={"command": "bridge", "source": source, "mode": mode, "targets": targets, "dry_run": args.dry_run},
     )
     record_run_task("created", meta=base_meta, command="bridge", data={"targets": targets, "mode": mode})
+    if not args.dry_run:
+        for target_id in targets:
+            if not _dispatch_readiness_gate(
+                target_id,
+                mode=mode,
+                command="bridge",
+                meta=base_meta,
+                no_preflight=args.no_preflight,
+                require_ready=args.require_ready,
+                refresh=args.refresh_readiness,
+                timeout=args.preflight_timeout,
+            ):
+                emit_event("run.completed", run_id=base_meta.get("run_id"), meta=base_meta, data={"command": "bridge", "return_code": 4, "dry_run": False})
+                record_run_task("failed", meta=base_meta, command="bridge", data={"return_code": 4, "reason": "readiness_refused"})
+                return 4
     if args.dry_run:
         media_suffixes = sorted({path.suffix for path in discover_prompt_heic_inputs(prompt, project_dir=PROJECT_DIR)})
         for target_id in targets:
@@ -1181,6 +1219,81 @@ def _enforce_dispatch_policy(action: str, *, source: str, mode: str, meta: dict[
     return None
 
 
+def _dispatch_readiness_gate(
+    target_id: str,
+    *,
+    mode: str,
+    command: str,
+    meta: dict[str, Any],
+    no_preflight: bool,
+    require_ready: bool,
+    refresh: bool,
+    timeout: int,
+) -> bool:
+    """Cache-first bounded gate with an explicit trace and task-ledger decision."""
+    if no_preflight:
+        decision = {"target": target_id, "decision": "bypass", "overall": "unknown", "stale": False, "age_seconds": None, "source": "operator"}
+        emit_event("dispatch.readiness_evaluated", run_id=meta.get("run_id"), meta=meta, data=decision)
+        record_run_task("updated", meta=meta, command=command, data={"readiness": decision})
+        return True
+    report = None if refresh else load_cached_preflight(target_id, "bridge", scope="work")
+    if report is not None:
+        try:
+            cached_project = Path(str(report.get("project_dir", ""))).expanduser().resolve()
+        except (OSError, RuntimeError):
+            cached_project = None
+        if cached_project != PROJECT_DIR:
+            report = None
+    source = "cache" if report is not None else "live"
+    if report is None:
+        try:
+            report = run_preflight(
+                target_id,
+                "bridge",
+                scope="work",
+                project_dir=PROJECT_DIR,
+                timeout=max(1, timeout),
+                expected_github_login=os.environ.get("AGENT_BRIDGE_EXPECTED_GITHUB_LOGIN", ""),
+            )
+        except Exception as exc:
+            report = {
+                "generated_at": iso_now(),
+                "overall": "blocked",
+                "checks": [{"name": "preflight_runtime", "required": True, "status": "blocked", "error_class": "source_unreachable", "detail": str(exc)}],
+            }
+    generated = _parse_iso_timestamp(report.get("generated_at"))
+    age_seconds = max(0, int((dt.datetime.now(dt.timezone.utc) - generated).total_seconds())) if generated else None
+    stale = bool(report.get("stale"))
+    overall = "unknown" if stale else str(report.get("overall", "unknown"))
+    refused = (mode == "code" and overall == "blocked") or (require_ready and overall != "ready")
+    action = "refuse" if refused else ("warn" if overall != "ready" else "allow")
+    decision = {
+        "target": target_id,
+        "decision": action,
+        "overall": overall,
+        "stale": stale,
+        "age_seconds": age_seconds,
+        "source": source,
+        "require_ready": require_ready,
+    }
+    emit_event("dispatch.readiness_evaluated", run_id=meta.get("run_id"), meta=meta, data=decision)
+    record_run_task("updated", meta=meta, command=command, data={"readiness": decision})
+    if refused:
+        blocked = ", ".join(
+            row.get("name", "unknown") for row in report.get("checks", []) if row.get("required") and row.get("status") == "blocked"
+        ) or overall
+        print(
+            f"[agent-bridge] readiness refused {target_id} {mode} dispatch: {blocked}. "
+            f"Run `agent code preflight work --client {target_id} --surface bridge --refresh` for details, "
+            "or use --no-preflight after operator review.",
+            file=sys.stderr,
+        )
+        return False
+    if action == "warn":
+        print(f"[agent-bridge] readiness warning for {target_id} {mode} dispatch: {overall}; continuing with trace evidence", file=sys.stderr)
+    return True
+
+
 def _json_print(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
@@ -1199,6 +1312,62 @@ def _hook_agent_command(client: str) -> str:
     if agent_bin.lower().endswith((".cmd", ".bat")) or "\\" in agent_bin:
         return f'cmd /d /c ""{agent_bin}" code hook session-start --client {client}"'
     return f"'{agent_bin}' code hook session-start --client {client}"
+
+
+def load_surface_manifest(path: Path = SURFACES_CONFIG) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    surfaces = data.get("surfaces")
+    if not isinstance(surfaces, list):
+        raise BridgeError(f"{path} must define a surfaces list")
+    declared: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    required_fields = {"client", "surface", "startup_mechanism", "config_path", "registration_command", "verification_method", "installable"}
+    for index, row in enumerate(surfaces):
+        if not isinstance(row, dict):
+            raise BridgeError(f"{path} surfaces[{index}] must be an object")
+        missing = sorted(required_fields - row.keys())
+        if missing:
+            raise BridgeError(f"{path} surfaces[{index}] is missing: {', '.join(missing)}")
+        key = (str(row["client"]), str(row["surface"]))
+        if key in seen:
+            raise BridgeError(f"{path} contains duplicate surface {key[0]}/{key[1]}")
+        seen.add(key)
+        declared.add(key[0])
+    try:
+        configured = load_config(DEFAULT_CONFIG)
+    except (BridgeError, OSError, json.JSONDecodeError):
+        configured = {}
+    for agent in configured.get("agents", []):
+        client = str(agent.get("id", ""))
+        if client and client not in declared:
+            surfaces.append(
+                {
+                    "client": client,
+                    "surface": "cli",
+                    "startup_mechanism": "unsupported",
+                    "config_path": "",
+                    "registration_command": "",
+                    "verification_method": "manifest entry required for newly configured agent",
+                    "installable": False,
+                    "note": "Synthesized because the configured agent has no startup-surface declaration.",
+                }
+            )
+    return data
+
+
+def infer_surface(client: str) -> str:
+    explicit = os.environ.get("AGENT_BRIDGE_SURFACE")
+    if explicit:
+        return safe_fragment(explicit)
+    hints = " ".join(
+        value
+        for name, value in os.environ.items()
+        if name in {"TERM_PROGRAM", "__CFBundleIdentifier", "CODEX_INTERNAL_ORIGINATOR", "CLAUDE_CODE_ENTRYPOINT"}
+    ).lower()
+    if any(token in hints for token in ("desktop", ".app", "cowork", "gui")):
+        return "gui"
+    return "cli"
 
 
 def _dedupe_paths(paths: list[Path]) -> list[Path]:
@@ -1226,11 +1395,13 @@ def _env_path_candidates(*names: str) -> list[Path]:
 
 def shared_skills_root_candidates() -> list[Path]:
     home = Path.home()
-    candidates = _env_path_candidates(
+    configured = resolve_shared_roots()["roots"]["skills"]["selected"]
+    candidates = [Path(configured)] if configured else []
+    candidates.extend(_env_path_candidates(
         "AGENT_BRIDGE_SHARED_SKILLS_ROOT",
         "SHARED_AGENT_SKILLS_ROOT",
         "CAREER_SHARED_SKILLS_ROOT",
-    )
+    ))
     for name in ("OneDriveCommercial", "OneDriveConsumer", "OneDrive"):
         value = os.environ.get(name)
         if value:
@@ -1268,12 +1439,18 @@ def resolve_shared_skills_root(
 
     candidates = shared_skills_root_candidates()
     for candidate in candidates:
-        if (candidate / SHARED_BRIDGE_DIR_NAME).exists():
-            return candidate
+        try:
+            if _bounded_io((candidate / SHARED_BRIDGE_DIR_NAME).exists, timeout=0.25):
+                return candidate
+        except (OSError, TimeoutError):
+            continue
     if not require_bridge_dir:
         for candidate in candidates:
-            if candidate.exists():
-                return candidate
+            try:
+                if _bounded_io(candidate.exists, timeout=0.25):
+                    return candidate
+            except (OSError, TimeoutError):
+                continue
     if create and candidates:
         candidates[0].mkdir(parents=True, exist_ok=True)
         return candidates[0]
@@ -1311,7 +1488,14 @@ def _harness_machine_id() -> str:
     return safe_fragment(f"{getpass.getuser()}@{socket.gethostname()}")
 
 
-def register_harness(client: str, *, root: str | None = None, status: str = "active") -> dict[str, Any]:
+def register_harness(
+    client: str,
+    *,
+    root: str | None = None,
+    status: str = "active",
+    surface: str = "",
+    startup_mechanism: str = "manual",
+) -> dict[str, Any]:
     bridge_dir = shared_bridge_dir(root, create=True)
     assert bridge_dir is not None
     registry_dir = bridge_dir / SHARED_REGISTRY_DIR_NAME
@@ -1320,12 +1504,17 @@ def register_harness(client: str, *, root: str | None = None, status: str = "act
     cwd = os.environ.get("PWD") or str(Path.cwd())
     client_id = safe_fragment(client)
     machine_id = _harness_machine_id()
-    path = registry_dir / f"{machine_id}.{client_id}.json"
+    surface_id = safe_fragment(surface) if surface else ""
+    suffix = f".{surface_id}" if surface_id else ""
+    path = registry_dir / f"{machine_id}.{client_id}{suffix}.json"
     record: dict[str, Any] = {
         "schema_version": "1.0",
         "updated_at": iso_now(),
         "status": status,
         "client": client,
+        "surface": surface or "unspecified",
+        "startup_mechanism": startup_mechanism,
+        "registration_proves_auth": False,
         "machine_id": machine_id,
         "hostname": socket.gethostname(),
         "username": getpass.getuser(),
@@ -1350,15 +1539,18 @@ def register_harness(client: str, *, root: str | None = None, status: str = "act
     return record
 
 
-def maybe_register_harness(client: str) -> dict[str, Any] | None:
+def maybe_register_harness(client: str, *, surface: str = "", startup_mechanism: str = "native-session-hook") -> dict[str, Any] | None:
     if os.environ.get("AGENT_BRIDGE_DISABLE_SHARED_REGISTRY") in {"1", "true", "TRUE", "yes"}:
         return None
     root = resolve_shared_skills_root(required=False, require_bridge_dir=True)
     if root is None:
         return None
     try:
-        return register_harness(client, root=str(root))
-    except OSError:
+        return _bounded_io(
+            lambda: register_harness(client, root=str(root), surface=surface, startup_mechanism=startup_mechanism),
+            timeout=2.0,
+        )
+    except (OSError, TimeoutError):
         return None
 
 
@@ -1371,6 +1563,30 @@ def _parse_iso_timestamp(value: Any) -> dt.datetime | None:
         return None
 
 
+def _bounded_io(action: Any, *, timeout: float) -> Any:
+    """Avoid hanging forever when a cloud-sync placeholder is offline."""
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            result["value"] = action()
+        except BaseException as exc:  # Preserve the original filesystem error in the caller.
+            result["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(max(0.01, timeout))
+    if worker.is_alive():
+        raise TimeoutError(f"shared-state I/O timed out after {timeout}s")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+def _bounded_read_text(path: Path, *, timeout: float = 0.5) -> str:
+    return str(_bounded_io(lambda: path.read_text(encoding="utf-8"), timeout=timeout))
+
+
 def load_harness_registry(root: str | None = None, *, stale_minutes: int = 1440) -> dict[str, Any]:
     bridge_dir = shared_bridge_dir(root, create=False)
     assert bridge_dir is not None
@@ -1380,8 +1596,8 @@ def load_harness_registry(root: str | None = None, *, stale_minutes: int = 1440)
     if registry_dir.exists():
         for path in sorted(registry_dir.glob("*.json")):
             try:
-                row = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+                row = json.loads(_bounded_read_text(path))
+            except (OSError, TimeoutError, json.JSONDecodeError) as exc:
                 row = {"client": "unknown", "machine_id": path.stem, "status": "invalid", "error": str(exc)}
             updated = _parse_iso_timestamp(row.get("updated_at"))
             age_seconds = int((now - updated).total_seconds()) if updated else None
@@ -1408,7 +1624,7 @@ def format_harness_registry(data: dict[str, Any]) -> str:
     if not rows:
         lines.append("(no harness registrations found)")
         return "\n".join(lines) + "\n"
-    lines.append("fresh\tclient\tmachine\tstatus\tupdated_at\tgit_root")
+    lines.append("fresh\tclient\tsurface\tmachine\tstatus\tupdated_at\tgit_root")
     for row in rows:
         fresh = "yes" if row.get("fresh") else "no"
         lines.append(
@@ -1416,6 +1632,7 @@ def format_harness_registry(data: dict[str, Any]) -> str:
                 [
                     fresh,
                     str(row.get("client", "")),
+                    str(row.get("surface", "unspecified")),
                     str(row.get("machine_id", "")),
                     str(row.get("status", "")),
                     str(row.get("updated_at", "")),
@@ -1648,7 +1865,7 @@ Use the installed `agent` command as the front door for local and cross-harness 
 
 - Check shared machine and harness presence: `agent code harness status`
 - Register the current harness manually: `agent code harness register --client <codex|claude|other>`
-- Check local SessionStart hooks: `agent code hooks status --client both`
+- Check local SessionStart hooks and wrappers: `agent code hooks status --client all`
 - List callable local engines: `agent code bridge --list`
 - Inspect trace events: `agent code trace`
 
@@ -1658,6 +1875,15 @@ Use the installed `agent` command as the front door for local and cross-harness 
 - Use `agent code bridge --mode code` only for scoped implementation tasks with an explicit worktree.
 - Use `agent code loop` for adversarial builder/critic/verifier loops; keep budgets explicit when cost matters.
 - Use mailbox MCP for async handoffs. Mailbox messages are the durable proof path; shell process lifetime is secondary.
+
+## Readiness and Context
+
+- Use `agent code preflight session --client <client> --surface <surface>` for a cache-first, startup-safe local check.
+- Use `agent code preflight work --client <client> --surface bridge` before authenticated source work. Configure the expected GitHub login and optional canonical context manifest with `agent code preflight configure`.
+- Inspect or set the separate SharedAgentSkills, SharedAgentData, and SharedAgentConversations roots with `agent code preflight roots`.
+- Code-mode bridge and loop dispatches block on failed required work checks. `--no-preflight` is an explicit operator override, not a default.
+- Generate and verify harness-native context adapters with `agent code context install` and `agent code context check`; the canonical content remains outside Agent Bridge.
+- Publish only the redacted cached summary with `agent code preflight publish`; never copy local diagnostic details or credentials into shared state.
 
 ## Media Handling
 
@@ -1781,6 +2007,48 @@ def doctor_cmd(argv: list[str]) -> int:
         bridge_dir=BRIDGE_DIR,
         config_loader=lambda: load_config(DEFAULT_CONFIG),
     )
+    roots = resolve_shared_roots()
+    for kind, row in roots["roots"].items():
+        report["checks"].append(
+            {
+                "check": f"shared_root:{kind}",
+                "status": "ok" if row["exists"] else "fail",
+                "detail": f"{row['selected']} ({'explicit' if row['explicit'] else 'discovered'})",
+            }
+        )
+    for conflict in roots["conflicts"]:
+        report["checks"].append(
+            {
+                "check": f"shared_root_conflict:{conflict['kind']}",
+                "status": "fail",
+                "detail": ", ".join(conflict["paths"]),
+            }
+        )
+    manifest = load_surface_manifest()
+    configured_clients = {agent["id"] for agent in load_config(DEFAULT_CONFIG)["agents"]}
+    declared_clients = {row["client"] for row in manifest["surfaces"]}
+    missing_clients = sorted(configured_clients - declared_clients)
+    report["checks"].append(
+        {
+            "check": "surface_manifest_coverage",
+            "status": "ok" if not missing_clients else "fail",
+            "detail": "all configured agents have startup surfaces" if not missing_clients else f"missing: {', '.join(missing_clients)}",
+        }
+    )
+    for surface in manifest["surfaces"]:
+        if not surface.get("installable") or (surface.get("enabled_by_default") is False and not surface_hook_installed(surface)):
+            status = "skip"
+        else:
+            status = "ok" if surface_hook_installed(surface) else "fail"
+        report["checks"].append(
+            {
+                "check": f"startup_surface:{surface['client']}:{surface['surface']}",
+                "status": status,
+                "detail": surface.get("startup_mechanism", "unknown"),
+            }
+        )
+    report["failures"] = sum(1 for row in report["checks"] if row["status"] == "fail")
+    report["ok"] = report["failures"] == 0
     _json_print(report) if args.json else print(format_doctor(report), end="")
     return 0 if report["ok"] else 1
 
@@ -1795,7 +2063,13 @@ def format_shared_skill_install(result: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def session_start_context(client: str, registration: dict[str, Any] | None = None) -> str:
+def session_start_context(
+    client: str,
+    *,
+    surface: str,
+    registration: dict[str, Any] | None = None,
+    readiness: dict[str, Any] | None = None,
+) -> str:
     cwd = os.environ.get("PWD") or str(Path.cwd())
     git_root = _git_root_for_path(cwd)
     location = f" Current git root: {git_root}." if git_root else ""
@@ -1805,6 +2079,12 @@ def session_start_context(client: str, registration: dict[str, Any] | None = Non
             " Shared registry heartbeat written to "
             f"`{registration['registry_file']}` for machine `{registration['machine_id']}`."
         )
+    readiness_text = ""
+    if readiness:
+        readiness_text = (
+            f" Cached session readiness is `{readiness.get('overall', 'unknown')}`; "
+            "run `agent code preflight work` before authenticated source work."
+        )
     return (
         "Agent Bridge session bootstrap: global command `agent` is available for bounded local "
         "agent coordination. Use `agent code bridge` for one-shot headless review/code turns and "
@@ -1812,18 +2092,33 @@ def session_start_context(client: str, registration: dict[str, Any] | None = Non
         "which falls back to one analysis-only adversarial agent unless the task is concrete enough "
         "for a full builder/critic/verifier spawn. Mailbox MCP, when registered, should point to "
         f"`{BRIDGE_DIR / 'mailbox_mcp.py'}`. Use `agent code harness status` to inspect shared "
-        f"OneDrive harness registrations. This startup hook never spawns agents. Client: {client}."
-        f"{location}{registry}"
+        f"OneDrive harness registrations. This startup hook never spawns agents or performs network calls. "
+        f"Client: {client}. Surface: {surface}."
+        f"{location}{registry}{readiness_text}"
     )
 
 
 def hook_session_start(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="agent code hook session-start", description="Emit SessionStart hook context.")
-    parser.add_argument("--client", choices=["codex", "claude"], required=True)
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--surface", default="auto", help="cli, gui, local-api, bridge, or auto detection")
+    parser.add_argument("--startup-mechanism", default="native-session-hook")
     parser.add_argument("--plain", action="store_true", help="Print plain context instead of hook JSON")
     args = parser.parse_args(argv)
-    registration = maybe_register_harness(args.client)
-    context = session_start_context(args.client, registration=registration)
+    surface = infer_surface(args.client) if args.surface == "auto" else safe_fragment(args.surface)
+    registration = maybe_register_harness(args.client, surface=surface, startup_mechanism=args.startup_mechanism)
+    try:
+        readiness = run_preflight(
+            args.client,
+            surface,
+            scope="session",
+            project_dir=Path(os.environ.get("PWD") or Path.cwd()),
+            timeout=2,
+            ttl_seconds=900,
+        )
+    except (OSError, ValueError):
+        readiness = None
+    context = session_start_context(args.client, surface=surface, registration=registration, readiness=readiness)
     if args.plain:
         print(context)
     else:
@@ -1888,12 +2183,14 @@ def _config_path(client: str) -> Path:
         return home / ".codex" / "hooks.json"
     if client == "claude":
         return home / ".claude" / "settings.json"
+    if client == "grok":
+        return home / ".grok" / "hooks" / "agent-bridge.json"
     raise BridgeError(f"unsupported hook client {client!r}")
 
 
 def install_session_hook(client: str) -> bool:
     path = _config_path(client)
-    default = {"hooks": {}} if client == "codex" else {}
+    default = {"hooks": {}}
     config = _load_json_config(path, default)
     changed = _ensure_command_hook(config, _hook_agent_command(client))
     if changed:
@@ -1914,26 +2211,179 @@ def session_hook_installed(client: str) -> bool:
     return False
 
 
+def _wrapper_text(surface: dict[str, Any]) -> str:
+    client = str(surface["client"])
+    surface_name = str(surface["surface"])
+    agent_bin = os.environ.get("AGENT_BRIDGE_HOOK_AGENT", os.path.expanduser("~/.local/bin/agent"))
+    if os.name == "nt":
+        hook = (
+            f'call "{agent_bin}" code hook session-start --client {client} --surface {surface_name} '
+            "--startup-mechanism wrapper --plain >NUL 2>NUL"
+        )
+        if surface.get("wrapper_target"):
+            launch = f'start "" msedge "{surface["wrapper_target"]}"'
+        elif surface.get("wrapper_app"):
+            launch = f'start "" "{surface["wrapper_app"]}"'
+        else:
+            command = shutil.which(client) or client
+            launch = f'"{command}" %*'
+        return f"@echo off\r\nrem agent-bridge startup wrapper: {client}/{surface_name}\r\n{hook}\r\n{launch}\r\n"
+    hook = (
+        f"{shlex.quote(agent_bin)} code hook session-start --client {shlex.quote(client)} "
+        f"--surface {shlex.quote(surface_name)} --startup-mechanism wrapper --plain >/dev/null || true"
+    )
+    if surface.get("wrapper_target"):
+        target = shlex.quote(str(surface["wrapper_target"]))
+        if sys.platform == "darwin":
+            launch = f"exec open -a 'Microsoft Edge' {target}"
+        else:
+            browser = shutil.which("microsoft-edge") or shutil.which("microsoft-edge-stable") or shutil.which("xdg-open") or "xdg-open"
+            launch = f"exec {shlex.quote(browser)} {target}"
+    elif surface.get("wrapper_app"):
+        app = shlex.quote(str(surface["wrapper_app"]))
+        launch = f"exec open -a {app}" if sys.platform == "darwin" else f"exec gtk-launch {app}"
+    else:
+        command = shutil.which(client) or client
+        launch = f"exec {shlex.quote(command)} \"$@\""
+    return f"#!/bin/sh\n# agent-bridge startup wrapper: {client}/{surface_name}\n{hook}\n{launch}\n"
+
+
+def _surface_config_path(surface: dict[str, Any]) -> Path:
+    path = Path(str(surface["config_path"])).expanduser()
+    if os.name == "nt" and surface.get("startup_mechanism") in {"wrapper-required", "service-probe"} and path.suffix.lower() != ".cmd":
+        path = path.with_name(path.name + ".cmd")
+    return path
+
+
+def install_surface_wrapper(surface: dict[str, Any]) -> bool:
+    path = _surface_config_path(surface)
+    expected = _wrapper_text(surface)
+    if path.exists() and path.read_text(encoding="utf-8") == expected:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        backup = path.with_name(f"{path.name}.bak-{utc_stamp()}")
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(expected, encoding="utf-8")
+    if os.name != "nt":
+        tmp.chmod(0o755)
+    tmp.replace(path)
+    return True
+
+
+def surface_hook_installed(surface: dict[str, Any]) -> bool:
+    mechanism = surface.get("startup_mechanism")
+    if mechanism == "native-session-hook":
+        return session_hook_installed(str(surface["client"]))
+    if mechanism in {"wrapper-required", "service-probe"} and surface.get("config_path"):
+        path = _surface_config_path(surface)
+        try:
+            return path.exists() and path.read_text(encoding="utf-8") == _wrapper_text(surface)
+        except OSError:
+            return False
+    return False
+
+
 def hooks_cmd(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="agent code hooks", description="Install or inspect Agent Bridge session hooks.")
     sub = parser.add_subparsers(dest="cmd", required=True)
     install = sub.add_parser("install")
-    install.add_argument("--client", choices=["codex", "claude", "both"], default="both")
+    install.add_argument("--client", default="all", help="codex, claude, grok, both, or all")
+    install.add_argument("--include-inactive", action="store_true", help="Include surfaces disabled by default, such as Claude")
+    install.add_argument("--json", action="store_true")
     status = sub.add_parser("status")
-    status.add_argument("--client", choices=["codex", "claude", "both"], default="both")
+    status.add_argument("--client", default="all", help="client name, both, or all")
+    status.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
-    clients = ["codex", "claude"] if args.client == "both" else [args.client]
+    manifest = load_surface_manifest()
+    if args.client == "both":
+        clients = ["codex", "claude"]
+    elif args.client == "all":
+        clients = sorted({row["client"] for row in manifest["surfaces"]})
+    else:
+        clients = [args.client]
     if args.cmd == "install":
+        rows: list[dict[str, Any]] = []
         for client in clients:
-            changed = install_session_hook(client)
-            verb = "installed" if changed else "already installed"
-            print(f"{client}: {verb} ({_config_path(client)})")
+            client_surfaces = [row for row in manifest["surfaces"] if row.get("client") == client]
+            inactive = client_surfaces and all(row.get("enabled_by_default") is False for row in client_surfaces)
+            if inactive and not args.include_inactive and args.client == "all":
+                for surface in client_surfaces:
+                    rows.append({"client": client, "surface": surface["surface"], "status": "inactive", "changed": False, "config_path": str(_surface_config_path(surface))})
+                continue
+            native_changed: bool | None = None
+            for surface in client_surfaces:
+                if not surface.get("installable"):
+                    rows.append({"client": client, "surface": surface["surface"], "status": surface.get("startup_mechanism", "unsupported"), "changed": False})
+                    continue
+                mechanism = surface.get("startup_mechanism")
+                if mechanism == "native-session-hook":
+                    if native_changed is None:
+                        native_changed = install_session_hook(client)
+                    changed = native_changed
+                else:
+                    changed = install_surface_wrapper(surface)
+                rows.append(
+                    {
+                        "client": client,
+                        "surface": surface["surface"],
+                        "status": "installed" if changed else "already-installed",
+                        "changed": changed,
+                        "config_path": str(_surface_config_path(surface)),
+                    }
+                )
+        if args.json:
+            _json_print({"schema_version": manifest.get("schema_version", "1.0"), "hooks": rows})
+        else:
+            for row in rows:
+                path = f" ({row['config_path']})" if row.get("config_path") else ""
+                print(f"{row['client']}: {row['status']}{path}")
         return 0
-    for client in clients:
-        installed = session_hook_installed(client)
-        print(f"{client}: {'installed' if installed else 'not installed'} ({_config_path(client)})")
-    return 0
+    try:
+        registry_rows = load_harness_registry(stale_minutes=1440).get("harnesses", [])
+    except (BridgeError, OSError, AssertionError):
+        registry_rows = []
+    registrations = {
+        (str(row.get("client", "")), str(row.get("surface", ""))): row
+        for row in registry_rows
+        if row.get("machine_id") == _harness_machine_id()
+    }
+    rows = []
+    for surface in manifest["surfaces"]:
+        if surface.get("client") not in clients:
+            continue
+        installable = bool(surface.get("installable"))
+        installed = surface_hook_installed(surface) if installable else False
+        registration = registrations.get((str(surface.get("client", "")), str(surface.get("surface", ""))))
+        registration_status = "fresh" if registration and registration.get("fresh") else ("stale" if registration else "missing")
+        status_value = "installed" if installed else (
+            "inactive"
+            if surface.get("enabled_by_default") is False
+            else ("missing" if installable else surface.get("startup_mechanism", "unsupported"))
+        )
+        if installed and registration_status == "stale":
+            status_value = "stale"
+        rows.append(
+            {
+                **surface,
+                "config_path": str(_surface_config_path(surface)) if surface.get("config_path") else "",
+                "status": status_value,
+                "registration_status": registration_status,
+                "registration_age_seconds": registration.get("age_seconds") if registration else None,
+                "registration_machine_id": registration.get("machine_id", "") if registration else "",
+                "registration_project": registration.get("git_root", "") if registration else "",
+            }
+        )
+    result = {"schema_version": manifest.get("schema_version", "1.0"), "hooks": rows}
+    if args.json:
+        _json_print(result)
+    else:
+        for row in rows:
+            path = f" ({row['config_path']})" if row.get("config_path") else ""
+            print(f"{row['client']}/{row['surface']}: {row['status']} [{row['startup_mechanism']}]{path}")
+    return 0 if all(row["status"] != "missing" for row in rows) else 1
 
 
 def harness_cmd(argv: list[str]) -> int:
@@ -1950,6 +2400,8 @@ def harness_cmd(argv: list[str]) -> int:
     register.add_argument("--client", required=True, help="Harness/client name, e.g. codex, claude, cursor, aider.")
     register.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
     register.add_argument("--status", default="active")
+    register.add_argument("--surface", default="", help="cli, gui, local-api, bridge, or another surface id")
+    register.add_argument("--startup-mechanism", default="manual")
     register.add_argument("--json", action="store_true")
 
     status = sub.add_parser("status", help="Show shared Agent Bridge harness registry rows.")
@@ -1967,12 +2419,217 @@ def harness_cmd(argv: list[str]) -> int:
         _json_print(result) if args.json else print(format_shared_skill_install(result), end="")
         return 0
     if args.cmd == "register":
-        record = register_harness(args.client, root=args.root, status=args.status)
+        record = register_harness(
+            args.client,
+            root=args.root,
+            status=args.status,
+            surface=args.surface,
+            startup_mechanism=args.startup_mechanism,
+        )
         _json_print(record) if args.json else print(f"{record['client']}: registered ({record['registry_file']})")
         return 0
     data = load_harness_registry(args.root, stale_minutes=args.stale_minutes)
     _json_print(data) if args.json else print(format_harness_registry(data), end="")
     return 0
+
+
+def format_preflight(report: dict[str, Any]) -> str:
+    lines = [
+        f"Preflight: {report.get('overall', 'unknown')}",
+        f"Scope: {report.get('scope', 'unknown')}",
+        f"Client/surface: {report.get('client', 'unknown')}/{report.get('surface', 'unknown')}",
+        f"Generated: {report.get('generated_at', '')}",
+    ]
+    if report.get("stale"):
+        lines.append("Cache: stale")
+    lines.append("")
+    for row in report.get("checks", []):
+        error = f" ({row['error_class']})" if row.get("error_class") else ""
+        required = "required" if row.get("required") else "advisory"
+        lines.append(f"[{row.get('status', 'unknown'):>8}] {row.get('name', '')} [{required}]{error}: {row.get('detail', '')}")
+    return "\n".join(lines) + "\n"
+
+
+def preflight_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agent code preflight",
+        description="Inspect session, authenticated work, and shared-root readiness without exposing secrets.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("session", "work"):
+        run = sub.add_parser(name)
+        run.add_argument("--client", default=os.environ.get("AGENT_BRIDGE_CALLER", "codex"))
+        run.add_argument("--surface", default="auto")
+        run.add_argument("--project-dir")
+        run.add_argument("--timeout", type=int, default=20)
+        run.add_argument("--ttl-seconds", type=int, default=900)
+        run.add_argument("--expected-github-login", default=os.environ.get("AGENT_BRIDGE_EXPECTED_GITHUB_LOGIN", ""))
+        run.add_argument("--context-manifest", default=os.environ.get("AGENT_BRIDGE_CONTEXT_MANIFEST", ""))
+        run.add_argument("--require-context", action="store_true")
+        run.add_argument("--refresh", action="store_true", help="Ignore a fresh cache entry")
+        run.add_argument("--json", action="store_true")
+    status = sub.add_parser("status")
+    status.add_argument("--client", default=os.environ.get("AGENT_BRIDGE_CALLER", "codex"))
+    status.add_argument("--surface", default="auto")
+    status.add_argument("--scope", choices=["session", "work"], default="session")
+    status.add_argument("--json", action="store_true")
+    publish = sub.add_parser("publish")
+    publish.add_argument("--client", default=os.environ.get("AGENT_BRIDGE_CALLER", "codex"))
+    publish.add_argument("--surface", default="auto")
+    publish.add_argument("--scope", choices=["session", "work"], default="work")
+    publish.add_argument("--data-root", default="")
+    publish.add_argument("--json", action="store_true")
+    flush = sub.add_parser("flush", help="Retry locally queued readiness publications")
+    flush.add_argument("--data-root", default="")
+    flush.add_argument("--json", action="store_true")
+    aggregate = sub.add_parser("aggregate", help="Rebuild a redacted multi-machine readiness view")
+    aggregate.add_argument("--data-root", default="")
+    aggregate.add_argument("--write", action="store_true")
+    aggregate.add_argument("--json", action="store_true")
+    roots = sub.add_parser("roots")
+    roots.add_argument("--create", action="store_true")
+    roots.add_argument("--set-skills")
+    roots.add_argument("--set-data")
+    roots.add_argument("--set-conversations")
+    roots.add_argument("--json", action="store_true")
+    configure = sub.add_parser("configure")
+    configure.add_argument("--github-login")
+    configure.add_argument("--require-github", action=argparse.BooleanOptionalAction, default=None)
+    configure.add_argument("--context-manifest")
+    configure.add_argument("--require-context", action=argparse.BooleanOptionalAction, default=None)
+    configure.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.cmd == "configure":
+        values = {
+            "github_login": args.github_login,
+            "require_github": args.require_github,
+            "context_manifest": str(Path(args.context_manifest).expanduser().resolve()) if args.context_manifest else None,
+            "require_context": args.require_context,
+        }
+        result = configure_readiness(values)
+        _json_print(result) if args.json else print(f"readiness config: {result['config_file']}")
+        return 0
+
+    if args.cmd == "roots":
+        configured = {
+            kind: value
+            for kind, value in {
+                "skills": args.set_skills,
+                "data": args.set_data,
+                "conversations": args.set_conversations,
+            }.items()
+            if value
+        }
+        config_result = configure_shared_roots(configured) if configured else None
+        result = resolve_shared_roots(create=args.create)
+        if config_result:
+            result["config_file"] = config_result["config_file"]
+        if args.json:
+            _json_print(result)
+        else:
+            print(f"Shared roots: {'ok' if result['ok'] else 'attention required'}")
+            for kind, row in result["roots"].items():
+                source = "explicit" if row["explicit"] else "discovered"
+                print(f"{kind}: {row['selected']} ({source}; {'exists' if row['exists'] else 'missing'})")
+            for conflict in result["conflicts"]:
+                print(f"conflict:{conflict['kind']}: {', '.join(conflict['paths'])}")
+        return 0 if result["ok"] else 1
+
+    if args.cmd in {"flush", "aggregate"}:
+        data_root = args.data_root
+        if not data_root:
+            roots_result = resolve_shared_roots()
+            data_row = roots_result["roots"]["data"]
+            if not data_row["explicit"]:
+                raise BridgeError("SharedAgentData must be explicitly configured for shared readiness operations")
+            data_root = data_row["selected"]
+        result = flush_readiness_queue(data_root=data_root) if args.cmd == "flush" else aggregate_readiness(data_root=data_root, write=args.write)
+        if args.json:
+            _json_print(result)
+        elif args.cmd == "flush":
+            print(f"readiness publications flushed: {result['flushed']}")
+        else:
+            print(f"readiness aggregate rows: {len(result['rows'])}")
+        return 0
+
+    surface = infer_surface(args.client) if args.surface == "auto" else safe_fragment(args.surface)
+    if args.cmd == "status":
+        report = load_cached_preflight(args.client, surface, scope=args.scope, allow_stale=True)
+        if report is None:
+            raise BridgeError(f"no cached preflight for {args.client}/{surface}; run `agent code preflight session` or `work`")
+        _json_print(report) if args.json else print(format_preflight(report), end="")
+        return 0 if report.get("overall") != "blocked" else 1
+    if args.cmd == "publish":
+        report = load_cached_preflight(args.client, surface, scope=args.scope, allow_stale=True)
+        if report is None:
+            raise BridgeError(f"no cached preflight for {args.client}/{surface}; publication never runs live probes")
+        result = publish_readiness(report, data_root=args.data_root)
+        if args.json:
+            _json_print(result)
+        elif result.get("published"):
+            print(f"published redacted readiness: {result['published_file']}")
+        else:
+            print(f"shared root unavailable; queued redacted readiness: {result['queued_file']}")
+        return 0 if result.get("published") else 2
+
+    project_dir = Path(args.project_dir).expanduser().resolve() if args.project_dir else discover_project_dir()
+    report = None
+    if args.cmd == "session" and not args.refresh:
+        report = load_cached_preflight(args.client, surface, scope="session")
+    if report is None:
+        report = run_preflight(
+            args.client,
+            surface,
+            scope=args.cmd,
+            project_dir=project_dir,
+            timeout=args.timeout,
+            ttl_seconds=args.ttl_seconds,
+            expected_github_login=args.expected_github_login,
+            context_manifest=args.context_manifest,
+            require_context=args.require_context,
+        )
+    _json_print(report) if args.json else print(format_preflight(report), end="")
+    return 0 if report.get("overall") != "blocked" else 1
+
+
+def context_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agent code context",
+        description="Generate or verify harness-native context adapters from one canonical manifest.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("install", "check", "status"):
+        command = sub.add_parser(name)
+        command.add_argument("--manifest", required=True)
+        command.add_argument("--client", default="")
+        if name == "install":
+            command.add_argument("--force", action="store_true", help="Replace an existing generated block after review")
+        command.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    manifest = Path(args.manifest).expanduser().resolve()
+    try:
+        if args.cmd == "status":
+            result = context_status(manifest, client=args.client)
+        else:
+            result = install_context_adapters(
+                manifest,
+                client=args.client,
+                check=args.cmd == "check",
+                force=bool(getattr(args, "force", False)),
+            )
+    except ContextAdapterError as exc:
+        raise BridgeError(str(exc)) from exc
+    if args.json:
+        _json_print(result)
+    else:
+        print(f"Context adapters: {'ok' if result['ok'] else 'attention required'}")
+        print(f"Canonical hash: {result.get('canonical_hash', '')}")
+        for row in result["adapters"]:
+            print(f"{row['client']}: {row['status']} ({row['path']})")
+        for overlap in result.get("overlaps", []):
+            print(f"overlap:{overlap['module']}: {overlap['source']} ({overlap['path']})")
+    return 0 if result["ok"] else 1
 
 
 def trace_cmd(argv: list[str]) -> int:
@@ -2418,6 +3075,10 @@ def parse_loop_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--prompt", help="Loop task prompt. If omitted in non-interactive mode, stdin is used.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned dispatches without invoking agents")
+    parser.add_argument("--no-preflight", action="store_true", help="Skip the default authenticated work-readiness gate")
+    parser.add_argument("--require-ready", action="store_true", help="Require fully ready reports for every dispatched phase")
+    parser.add_argument("--refresh-readiness", action="store_true", help="Refresh readiness instead of using fresh caches")
+    parser.add_argument("--preflight-timeout", type=int, default=20, help="Maximum seconds for each readiness probe")
     add_meta_args(parser)
     return parser.parse_args(argv)
 
@@ -2497,6 +3158,30 @@ def loop(argv: list[str]) -> int:
             "dry_run": args.dry_run,
         },
     )
+    if not args.dry_run:
+        target_modes: dict[str, str] = {}
+        phases_for_gate = (
+            [(args.builder, "code"), (args.critic, "review"), (args.verifier, "review")]
+            if decision.mode == "full_loop"
+            else [(args.critic, "review")]
+        )
+        for target_id, target_mode in phases_for_gate:
+            if target_mode == "code" or target_id not in target_modes:
+                target_modes[target_id] = target_mode
+        for target_id, target_mode in target_modes.items():
+            if not _dispatch_readiness_gate(
+                target_id,
+                mode=target_mode,
+                command="loop",
+                meta=base_meta,
+                no_preflight=args.no_preflight,
+                require_ready=args.require_ready,
+                refresh=args.refresh_readiness,
+                timeout=args.preflight_timeout,
+            ):
+                emit_event("run.completed", run_id=base_meta.get("run_id"), meta=base_meta, data={"command": "loop", "return_code": 4, "dry_run": False})
+                record_run_task("failed", meta=base_meta, command="loop", data={"return_code": 4, "reason": "readiness_refused"})
+                return 4
     emit_event(
         "dispatch.policy_evaluated",
         run_id=base_meta.get("run_id"),
@@ -2598,6 +3283,10 @@ def main(argv: list[str]) -> int:
         return hooks_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "harness":
         return harness_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "preflight":
+        return preflight_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "context":
+        return context_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "doctor":
         return doctor_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] in {"capabilities", "tasks", "transport", "policy", "eval", "daemon"}:
@@ -2617,6 +3306,8 @@ def main(argv: list[str]) -> int:
     print("       agent code hook session-start [options]", file=sys.stderr)
     print("       agent code hooks <install|status> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
+    print("       agent code preflight <session|work|status|publish|flush|aggregate|roots|configure> [options]", file=sys.stderr)
+    print("       agent code context <install|check|status> --manifest PATH [options]", file=sys.stderr)
     print("       agent code doctor [options]", file=sys.stderr)
     print("       agent code capabilities [options]", file=sys.stderr)
     print("       agent code tasks <create|claim|update|request-input|cancel|resume|attach|inspect|list> [options]", file=sys.stderr)

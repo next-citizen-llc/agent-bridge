@@ -6,7 +6,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
+
+from agent_bridge import cli as bridge_cli
+from agent_bridge.cli import is_auth_error
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +18,108 @@ AGENT = ROOT / "bin" / "agent"
 
 
 class BridgeCliTests(unittest.TestCase):
+    def test_auth_error_recognizes_logged_out_claude_cli(self) -> None:
+        self.assertTrue(is_auth_error("Not logged in · Please run /login"))
+
+    def test_code_readiness_gate_refuses_blocked_required_probe_and_traces_decision(self) -> None:
+        report = {
+            "generated_at": "2030-01-01T00:00:00Z",
+            "overall": "blocked",
+            "project_dir": str(bridge_cli.PROJECT_DIR),
+            "checks": [{"name": "github_identity", "required": True, "status": "blocked"}],
+        }
+        with mock.patch.object(bridge_cli, "load_cached_preflight", return_value=report):
+            with mock.patch.object(bridge_cli, "emit_event") as emit:
+                with mock.patch.object(bridge_cli, "record_run_task"):
+                    allowed = bridge_cli._dispatch_readiness_gate(
+                        "codex",
+                        mode="code",
+                        command="bridge",
+                        meta={"run_id": "run_test"},
+                        no_preflight=False,
+                        require_ready=False,
+                        refresh=False,
+                        timeout=1,
+                    )
+        self.assertFalse(allowed)
+        self.assertEqual(emit.call_args.kwargs["data"]["decision"], "refuse")
+
+    def test_review_readiness_gate_warns_but_operator_bypass_is_explicit(self) -> None:
+        report = {"generated_at": "2030-01-01T00:00:00Z", "overall": "degraded", "project_dir": str(bridge_cli.PROJECT_DIR), "checks": []}
+        with mock.patch.object(bridge_cli, "load_cached_preflight", return_value=report):
+            with mock.patch.object(bridge_cli, "emit_event") as emit:
+                with mock.patch.object(bridge_cli, "record_run_task"):
+                    allowed = bridge_cli._dispatch_readiness_gate(
+                        "grok",
+                        mode="review",
+                        command="bridge",
+                        meta={"run_id": "run_review"},
+                        no_preflight=False,
+                        require_ready=False,
+                        refresh=False,
+                        timeout=1,
+                    )
+                    bypassed = bridge_cli._dispatch_readiness_gate(
+                        "grok",
+                        mode="code",
+                        command="bridge",
+                        meta={"run_id": "run_bypass"},
+                        no_preflight=True,
+                        require_ready=True,
+                        refresh=False,
+                        timeout=1,
+                    )
+        self.assertTrue(allowed)
+        self.assertTrue(bypassed)
+        self.assertEqual(emit.call_args.kwargs["data"]["decision"], "bypass")
+
+    def test_readiness_gate_refreshes_cache_from_another_project(self) -> None:
+        cached = {"generated_at": "2030-01-01T00:00:00Z", "overall": "ready", "project_dir": "/different/project", "checks": []}
+        live = {"generated_at": "2030-01-01T00:00:01Z", "overall": "ready", "project_dir": str(bridge_cli.PROJECT_DIR), "checks": []}
+        with mock.patch.object(bridge_cli, "load_cached_preflight", return_value=cached):
+            with mock.patch.object(bridge_cli, "run_preflight", return_value=live) as run:
+                with mock.patch.object(bridge_cli, "emit_event"):
+                    with mock.patch.object(bridge_cli, "record_run_task"):
+                        allowed = bridge_cli._dispatch_readiness_gate(
+                            "codex",
+                            mode="code",
+                            command="bridge",
+                            meta={"run_id": "run_project_scope"},
+                            no_preflight=False,
+                            require_ready=False,
+                            refresh=False,
+                            timeout=1,
+                        )
+        self.assertTrue(allowed)
+        run.assert_called_once()
+
+    def test_context_check_exits_nonzero_for_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            policy = "Canonical context text must not be duplicated."
+            (root / "policy.md").write_text(policy, encoding="utf-8")
+            (root / "GROK.md").write_text(policy, encoding="utf-8")
+            manifest = root / "context.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "modules": [{"id": "policy", "path": "policy.md"}],
+                        "adapters": [{"client": "grok", "path": "GROK.md", "modules": ["policy"]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                [str(AGENT), "code", "context", "check", "--manifest", str(manifest)],
+                cwd=str(ROOT),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("overlap:policy", proc.stdout)
+
     def _write_fake_claude(self, tmp: str) -> Path:
         fake = Path(tmp) / "fake_claude.py"
         fake.write_text(
@@ -563,7 +669,7 @@ class BridgeCliTests(unittest.TestCase):
                 "AGENT_BRIDGE_MACHINE_ID": "test-machine",
             }
             proc = subprocess.run(
-                [str(AGENT), "code", "hook", "session-start", "--client", "codex"],
+                [str(AGENT), "code", "hook", "session-start", "--client", "codex", "--surface", "cli"],
                 cwd=str(ROOT),
                 env=env,
                 text=True,
@@ -571,7 +677,7 @@ class BridgeCliTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 check=False,
             )
-            registry_file = shared_root / "Agent-Bridge" / "registry" / "test-machine.codex.json"
+            registry_file = shared_root / "Agent-Bridge" / "registry" / "test-machine.codex.cli.json"
             self.assertEqual(proc.returncode, 0, proc.stderr)
             payload = json.loads(proc.stdout)
             output = payload["hookSpecificOutput"]
@@ -582,6 +688,9 @@ class BridgeCliTests(unittest.TestCase):
             self.assertIn(str(registry_file), output["additionalContext"])
             self.assertIn(str(ROOT / "agent_bridge" / "mailbox_mcp.py"), output["additionalContext"])
             self.assertTrue(registry_file.exists())
+            registration = json.loads(registry_file.read_text(encoding="utf-8"))
+            self.assertEqual(registration["surface"], "cli")
+            self.assertFalse(registration["registration_proves_auth"])
 
     def test_harness_register_and_status_use_shared_agent_skills_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -639,7 +748,10 @@ class BridgeCliTests(unittest.TestCase):
             payload = json.loads(proc.stdout)
             self.assertEqual(payload["skill_path"], str(skill))
             self.assertTrue(skill.exists())
-            self.assertIn("name: agent-bridge", skill.read_text(encoding="utf-8"))
+            skill_text = skill.read_text(encoding="utf-8")
+            self.assertIn("name: agent-bridge", skill_text)
+            self.assertIn("agent code preflight configure", skill_text)
+            self.assertIn("agent code context check", skill_text)
             self.assertEqual(codex_link.resolve(), (shared_root / "Agent-Bridge").resolve())
             self.assertEqual(claude_link.resolve(), (shared_root / "Agent-Bridge").resolve())
             self.assertEqual(agents_link.resolve(), (shared_root / "Agent-Bridge").resolve())
@@ -706,6 +818,166 @@ class BridgeCliTests(unittest.TestCase):
             hook["command"],
             r'cmd /d /c ""C:\Users\me\.local\bin\agent.cmd" code hook session-start --client codex"',
         )
+
+    def test_hooks_install_supports_grok_directory_and_surface_status_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "HOME": tmp, "AGENT_BRIDGE_HOOK_AGENT": "/tmp/agent"}
+            install = subprocess.run(
+                [str(AGENT), "code", "hooks", "install", "--client", "grok", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            status = subprocess.run(
+                [str(AGENT), "code", "hooks", "status", "--client", "grok", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            path = Path(tmp) / ".grok" / "hooks" / "agent-bridge.json"
+            config = json.loads(path.read_text(encoding="utf-8"))
+            wrapper_text = (Path(tmp) / ".local" / "bin" / "grok-gui-bridge").read_text(encoding="utf-8")
+        self.assertEqual(install.returncode, 0, install.stderr)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        command = config["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertEqual(command, "'/tmp/agent' code hook session-start --client grok")
+        rows = json.loads(status.stdout)["hooks"]
+        self.assertEqual({row["surface"] for row in rows}, {"cli", "gui"})
+        self.assertEqual(next(row for row in rows if row["surface"] == "cli")["status"], "installed")
+        self.assertEqual(next(row for row in rows if row["surface"] == "gui")["status"], "installed")
+        self.assertIn("Microsoft Edge", wrapper_text)
+
+    def test_code_dispatch_runs_work_preflight_and_honors_configured_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_codex = root / "codex"
+            fake_codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1 $2\" = \"login status\" ]; then echo 'Logged in'; exit 0; fi\n"
+                "if [ \"$1 $2 $3\" = \"mcp list --json\" ]; then echo '[]'; exit 0; fi\n"
+                "echo BRIDGE_PREFLIGHT_OK\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            fake_gh = root / "gh"
+            fake_gh.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1 $2\" = \"auth status\" ]; then exit 0; fi\n"
+                "if [ \"$1 $2\" = \"api user\" ]; then echo test-login; exit 0; fi\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{root}:/usr/bin:/bin",
+                "CODEX_BIN": str(fake_codex),
+                "AGENT_BRIDGE_STATE_DIR": str(root / "state"),
+                "AGENT_BRIDGE_EXPECTED_GITHUB_LOGIN": "test-login",
+                "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(root / "skills"),
+                "AGENT_BRIDGE_SHARED_DATA_ROOT": str(root / "data"),
+                "AGENT_BRIDGE_SHARED_CONVERSATIONS_ROOT": str(root / "conversations"),
+            }
+            for name in ("skills", "data", "conversations"):
+                (root / name).mkdir()
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "bridge",
+                    "--from",
+                    "human",
+                    "--to",
+                    "codex",
+                    "--mode",
+                    "code",
+                    "--prompt",
+                    "bounded smoke test",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            cached = list((root / "state" / "readiness").glob("*.codex.bridge.work.json"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("BRIDGE_PREFLIGHT_OK", proc.stdout)
+        self.assertEqual(len(cached), 1)
+
+    def test_code_dispatch_blocks_logged_out_zero_exit_and_override_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "dispatched"
+            fake_codex = root / "codex"
+            fake_codex.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1 $2\" = \"login status\" ]; then echo 'Not logged in · Please run /login'; exit 0; fi\n"
+                "if [ \"$1 $2 $3\" = \"mcp list --json\" ]; then echo '[]'; exit 0; fi\n"
+                f"touch {marker}\n"
+                "echo OVERRIDE_DISPATCH_OK\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            fake_gh = root / "gh"
+            fake_gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_gh.chmod(0o755)
+            env = {
+                **os.environ,
+                "HOME": str(root),
+                "PATH": f"{root}:/usr/bin:/bin",
+                "CODEX_BIN": str(fake_codex),
+                "AGENT_BRIDGE_STATE_DIR": str(root / "state"),
+                "AGENT_BRIDGE_READINESS_CONFIG": str(root / "readiness.json"),
+                "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(root / "skills"),
+                "AGENT_BRIDGE_SHARED_DATA_ROOT": str(root / "data"),
+                "AGENT_BRIDGE_SHARED_CONVERSATIONS_ROOT": str(root / "conversations"),
+            }
+            for name in ("skills", "data", "conversations"):
+                (root / name).mkdir()
+            base = [
+                str(AGENT),
+                "code",
+                "bridge",
+                "--from",
+                "human",
+                "--to",
+                "codex",
+                "--mode",
+                "code",
+                "--prompt",
+                "bounded smoke test",
+            ]
+            blocked = subprocess.run(
+                base,
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            dispatched_before_override = marker.exists()
+            override = subprocess.run(
+                [*base, "--no-preflight"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        self.assertEqual(blocked.returncode, 4, blocked.stderr)
+        self.assertFalse(dispatched_before_override)
+        self.assertEqual(override.returncode, 0, override.stderr)
+        self.assertIn("OVERRIDE_DISPATCH_OK", override.stdout)
 
 
 if __name__ == "__main__":

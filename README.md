@@ -79,12 +79,39 @@ Install lightweight SessionStart hooks and startup wrappers for active harness s
 agent code hooks install --client all
 ```
 
-The hook injects a short reminder that Agent Bridge is available, points agents at the global
-mailbox MCP path, and notes that `agent code loop` uses the auto dispatch gate. If a shared
-OneDrive `SharedAgentSkills/Agent-Bridge` folder is available, it also writes a small JSON
-heartbeat for the current client and surface. It does not prove authentication, spawn agents, run
-network calls, or mutate project files during session startup. Claude remains declared but is
-inactive by default; install it explicitly with `--client claude` when needed.
+The hook first runs a bounded automatic refresh of the canonical Agent Bridge checkout, then
+injects a short reminder that Agent Bridge is available and writes a shared registry heartbeat.
+It does not prove authentication, spawn agents, or mutate the active project. Claude remains
+declared but is inactive by default; install it explicitly with `--client claude` when needed.
+
+## Automatic Updates
+
+Every installed SessionStart hook and GUI wrapper checks the canonical checkout before the
+harness registers itself. Checks are cached for five minutes by default. A refresh proceeds only
+when all of these conditions hold:
+
+- the checkout is on `main` and has no local changes;
+- `origin` is the configured canonical GitHub repository;
+- `origin/main` is a strict fast-forward of the local revision; and
+- Git can fetch without an interactive credential prompt.
+
+When the revision changes, the updater compiles the Python package, refreshes the `agent`
+launcher, reinstalls hooks and wrappers, refreshes the shared skill and its Codex, Claude, Grok,
+and `.agents` links, and re-executes the startup hook once so the new code supplies session
+context. Dirty, non-main, ahead, or diverged checkouts are left untouched. Offline startup uses
+the last installed revision and briefly caches the failed fetch.
+
+Inspect or run it directly:
+
+```bash
+agent code update status
+agent code update check
+agent code update apply --force
+```
+
+Set `AGENT_BRIDGE_DISABLE_AUTO_UPDATE=1` for an emergency startup bypass. Override the normal
+cache and fetch bounds with `AGENT_BRIDGE_UPDATE_INTERVAL_SECONDS` and
+`AGENT_BRIDGE_UPDATE_TIMEOUT`.
 
 Check hook status:
 

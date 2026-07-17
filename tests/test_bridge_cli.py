@@ -667,6 +667,8 @@ class BridgeCliTests(unittest.TestCase):
                 **os.environ,
                 "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(shared_root),
                 "AGENT_BRIDGE_MACHINE_ID": "test-machine",
+                "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state"),
+                "AGENT_BRIDGE_DISABLE_AUTO_UPDATE": "1",
             }
             proc = subprocess.run(
                 [str(AGENT), "code", "hook", "session-start", "--client", "codex", "--surface", "cli"],
@@ -691,6 +693,11 @@ class BridgeCliTests(unittest.TestCase):
             registration = json.loads(registry_file.read_text(encoding="utf-8"))
             self.assertEqual(registration["surface"], "cli")
             self.assertFalse(registration["registration_proves_auth"])
+            self.assertEqual(registration["bridge_revision"], subprocess.check_output(
+                ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True
+            ).strip())
+            self.assertIn("deployed_revision", registration)
+            self.assertIn("update_status", registration)
 
     def test_harness_register_and_status_use_shared_agent_skills_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -726,6 +733,22 @@ class BridgeCliTests(unittest.TestCase):
             self.assertEqual(payload["harnesses"][0]["client"], "codex")
             self.assertTrue(payload["harnesses"][0]["fresh"])
 
+    def test_session_start_reexecutes_once_after_bridge_update(self) -> None:
+        update = {
+            "status": "updated",
+            "local_revision": "a" * 40,
+            "deployed_revision": "a" * 40,
+            "reexec_required": True,
+        }
+        with mock.patch.object(bridge_cli, "update_bridge", return_value=update):
+            with mock.patch.object(bridge_cli.os, "execve", side_effect=RuntimeError("reexec")) as execute:
+                with self.assertRaisesRegex(RuntimeError, "reexec"):
+                    bridge_cli.hook_session_start(["--client", "codex", "--surface", "cli"])
+        command = execute.call_args.args[1]
+        environment = execute.call_args.args[2]
+        self.assertIn("--skip-update", command)
+        self.assertEqual(environment["AGENT_BRIDGE_UPDATE_REEXEC"], "1")
+
     def test_harness_install_skill_writes_skill_and_local_links(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -752,9 +775,37 @@ class BridgeCliTests(unittest.TestCase):
             self.assertIn("name: agent-bridge", skill_text)
             self.assertIn("agent code preflight configure", skill_text)
             self.assertIn("agent code context check", skill_text)
+            self.assertIn("agent code update <status|check|apply>", skill_text)
             self.assertEqual(codex_link.resolve(), (shared_root / "Agent-Bridge").resolve())
             self.assertEqual(claude_link.resolve(), (shared_root / "Agent-Bridge").resolve())
             self.assertEqual(agents_link.resolve(), (shared_root / "Agent-Bridge").resolve())
+            self.assertEqual((home / ".grok" / "skills" / "agent-bridge").resolve(), (shared_root / "Agent-Bridge").resolve())
+
+    def test_install_skill_retargets_a_stale_grok_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            shared_root = Path(tmp) / "SharedAgentSkills"
+            stale = Path(tmp) / "old-skill"
+            stale.mkdir()
+            grok_link = home / ".grok" / "skills" / "agent-bridge"
+            grok_link.parent.mkdir(parents=True)
+            grok_link.symlink_to(stale, target_is_directory=True)
+            env = {**os.environ, "HOME": str(home), "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(shared_root)}
+            proc = subprocess.run(
+                [str(AGENT), "code", "harness", "install-skill", "--link-client", "grok", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            payload = json.loads(proc.stdout)
+            resolved_grok_link = grok_link.resolve()
+            resolved_shared_skill = (shared_root / "Agent-Bridge").resolve()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(payload["links"][0]["status"], "retargeted")
+        self.assertEqual(resolved_grok_link, resolved_shared_skill)
 
     def test_hooks_install_is_idempotent_for_codex_and_claude(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

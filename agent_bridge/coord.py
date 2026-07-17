@@ -802,17 +802,21 @@ def run_doctor(
                     check("shared_skill_fresh", True, "installed skill matches generated text")
                 else:
                     check("shared_skill_fresh", False, "installed skill text drifted; rerun `agent code harness install-skill`")
-        for client_dir in (Path.home() / ".claude" / "skills", Path.home() / ".codex" / "skills"):
+        for client_dir in (
+            Path.home() / ".claude" / "skills",
+            Path.home() / ".codex" / "skills",
+            Path.home() / ".grok" / "skills",
+            Path.home() / ".agents" / "skills",
+        ):
             link = client_dir / "agent-bridge"
             if not link.exists() and not link.is_symlink():
                 check(f"skill_link:{client_dir.parent.name}", None, f"{link} not present")
                 continue
-            if link.is_symlink():
-                target = link.resolve() if link.exists() else None
-                ok = target is not None and str(target).startswith(str(skill_dir.resolve() if skill_dir.exists() else skill_dir))
-                check(f"skill_link:{client_dir.parent.name}", ok, f"{link} -> {target or 'broken'}")
-            else:
-                check(f"skill_link:{client_dir.parent.name}", False, f"{link} exists but is not a symlink")
+            target = link.resolve() if link.exists() else None
+            expected = skill_dir.resolve() if skill_dir.exists() else skill_dir
+            ok = target == expected
+            kind = "symlink" if link.is_symlink() else "directory link"
+            check(f"skill_link:{client_dir.parent.name}", ok, f"{link} -> {target or 'broken'} ({kind})")
 
     hook_configs = (
         (".claude", (Path.home() / ".claude" / "settings.json",)),

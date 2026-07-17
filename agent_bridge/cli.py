@@ -85,6 +85,15 @@ from .readiness import (
     run_preflight,
 )
 from .trace import emit_event, events_path, format_events, load_events
+from .updater import (
+    DEFAULT_EXPECTED_REMOTE,
+    DEFAULT_INTERVAL_SECONDS,
+    DEFAULT_TIMEOUT_SECONDS,
+    bridge_revision,
+    format_update,
+    load_update_state,
+    update_bridge,
+)
 from .workflow import (
     WorkflowError,
     format_inspection,
@@ -1481,6 +1490,18 @@ def _git_root_for_path(path: str) -> str:
         return ""
 
 
+def _git_revision(repo: Path, ref: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", ref],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ""
+
+
 def _harness_machine_id() -> str:
     explicit = os.environ.get("AGENT_BRIDGE_MACHINE_ID")
     if explicit:
@@ -1507,6 +1528,8 @@ def register_harness(
     surface_id = safe_fragment(surface) if surface else ""
     suffix = f".{surface_id}" if surface_id else ""
     path = registry_dir / f"{machine_id}.{client_id}{suffix}.json"
+    update_state = load_update_state()
+    bridge_repo = BRIDGE_DIR.parent
     record: dict[str, Any] = {
         "schema_version": "1.0",
         "updated_at": iso_now(),
@@ -1523,7 +1546,12 @@ def register_harness(
         "cwd": cwd,
         "git_root": _git_root_for_path(cwd),
         "agent_command": shutil.which("agent") or os.environ.get("AGENT_BRIDGE_HOOK_AGENT") or "",
-        "bridge_repo": str(BRIDGE_DIR.parent),
+        "bridge_repo": str(bridge_repo),
+        "bridge_revision": bridge_revision(bridge_repo),
+        "origin_main_revision": _git_revision(bridge_repo, "refs/remotes/origin/main"),
+        "deployed_revision": str(update_state.get("deployed_revision", "")),
+        "update_status": str(update_state.get("status", "unknown")),
+        "update_checked_at": str(update_state.get("checked_at", "")),
         "mailbox_mcp": str(BRIDGE_DIR / "mailbox_mcp.py"),
         "state_dir": str(STATE_DIR),
         "shared_bridge_dir": str(bridge_dir),
@@ -1866,8 +1894,17 @@ Use the installed `agent` command as the front door for local and cross-harness 
 - Check shared machine and harness presence: `agent code harness status`
 - Register the current harness manually: `agent code harness register --client <codex|claude|other>`
 - Check local SessionStart hooks and wrappers: `agent code hooks status --client all`
+- Inspect or force the canonical bridge refresh: `agent code update <status|check|apply>`
 - List callable local engines: `agent code bridge --list`
 - Inspect trace events: `agent code trace`
+
+## Automatic Update
+
+- Every installed SessionStart hook and GUI wrapper runs a cached, bounded update check before registering the harness.
+- Updates only run from a clean `main` checkout whose `origin` matches the canonical repository. They fetch without prompting and accept fast-forwards only.
+- A changed revision is compiled and then refreshes the launcher, hooks, wrappers, and Codex, Claude, Grok, and shared `.agents` skill links. The startup hook re-executes once so the new code supplies the current session context.
+- Dirty, non-main, ahead, or diverged checkouts are never overwritten. Offline starts continue with the last installed revision and cache the failure briefly.
+- Set `AGENT_BRIDGE_DISABLE_AUTO_UPDATE=1` for an emergency startup bypass. Use `agent code update apply --force` to bypass only the normal freshness interval.
 
 ## Coordination
 
@@ -1917,10 +1954,17 @@ def _skill_link_paths(client: str) -> list[Path]:
         return [home / ".codex" / "skills" / SHARED_SKILL_LINK_NAME]
     if client == "claude":
         return [home / ".claude" / "skills" / SHARED_SKILL_LINK_NAME]
+    if client == "grok":
+        return [home / ".grok" / "skills" / SHARED_SKILL_LINK_NAME]
     if client == "agents":
         return [home / ".agents" / "skills" / SHARED_SKILL_LINK_NAME]
     if client == "all":
-        return _skill_link_paths("codex") + _skill_link_paths("claude") + _skill_link_paths("agents")
+        return (
+            _skill_link_paths("codex")
+            + _skill_link_paths("claude")
+            + _skill_link_paths("grok")
+            + _skill_link_paths("agents")
+        )
     return []
 
 
@@ -1931,12 +1975,29 @@ def _ensure_skill_link(link_path: Path, target: Path) -> dict[str, str]:
                 return {"path": str(link_path), "status": "already linked"}
         except OSError:
             pass
-        return {"path": str(link_path), "status": "exists; left unchanged"}
+        if not link_path.is_symlink():
+            return {"path": str(link_path), "status": "exists; left unchanged"}
+        try:
+            link_path.unlink()
+        except OSError as exc:
+            return {"path": str(link_path), "status": f"retarget failed: {exc}"}
+        status = "retargeted"
+    else:
+        status = "linked"
     link_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.symlink(target, link_path, target_is_directory=True)
-        return {"path": str(link_path), "status": "linked"}
+        return {"path": str(link_path), "status": status}
     except OSError as exc:
+        if os.name == "nt":
+            proc = subprocess.run(
+                ["cmd", "/d", "/c", "mklink", "/J", str(link_path), str(target)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return {"path": str(link_path), "status": "junction-retargeted" if status == "retargeted" else "junction-linked"}
         return {"path": str(link_path), "status": f"link failed: {exc}"}
 
 
@@ -1975,14 +2036,15 @@ def check_shared_skill(root: str | None = None, *, link_client: str = "all") -> 
         name = f"skill_link:{link.parent.parent.name}"
         if not link.exists() and not link.is_symlink():
             checks.append({"check": name, "status": "skip", "detail": f"{link} not present"})
-        elif not link.is_symlink():
-            checks.append({"check": name, "status": "fail", "detail": f"{link} exists but is not a symlink"})
         else:
             try:
-                ok = link.exists() and link.resolve() == bridge_dir.resolve()
+                target = link.resolve() if link.exists() else None
+                ok = target == bridge_dir.resolve()
             except OSError:
+                target = None
                 ok = False
-            detail = f"{link} -> {link.resolve() if link.exists() else 'broken'}"
+            kind = "symlink" if link.is_symlink() else "directory link"
+            detail = f"{link} -> {target or 'broken'} ({kind})"
             checks.append({"check": name, "status": "ok" if ok else "fail", "detail": detail})
     ok = all(row["status"] != "fail" for row in checks)
     return {"ok": ok, "shared_bridge_dir": str(bridge_dir), "checks": checks}
@@ -2063,12 +2125,50 @@ def format_shared_skill_install(result: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def update_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agent code update",
+        description="Safely inspect or fast-forward the canonical Agent Bridge checkout.",
+    )
+    sub = parser.add_subparsers(dest="action", required=True)
+    for action in ("status", "check", "apply"):
+        command = sub.add_parser(action)
+        command.add_argument(
+            "--repo",
+            default=os.environ.get("AGENT_BRIDGE_REPO", str(BRIDGE_DIR.parent)),
+            help="Canonical Agent Bridge checkout.",
+        )
+        command.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+        command.add_argument("--interval-seconds", type=int, default=DEFAULT_INTERVAL_SECONDS)
+        command.add_argument("--force", action="store_true", help="Ignore the recent-check cache.")
+        command.add_argument(
+            "--expected-remote",
+            default=os.environ.get("AGENT_BRIDGE_EXPECTED_REMOTE", DEFAULT_EXPECTED_REMOTE),
+        )
+        command.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    result = update_bridge(
+        Path(args.repo),
+        action=args.action,
+        force=args.force,
+        interval_seconds=max(0, args.interval_seconds),
+        timeout=max(1, args.timeout),
+        expected_remote=args.expected_remote,
+    )
+    _json_print(result) if args.json else print(format_update(result), end="")
+    success = {"current", "current_cached", "updated"}
+    if args.action == "check":
+        success.add("update_available")
+    return 0 if result.get("status") in success else 1
+
+
 def session_start_context(
     client: str,
     *,
     surface: str,
     registration: dict[str, Any] | None = None,
     readiness: dict[str, Any] | None = None,
+    update: dict[str, Any] | None = None,
 ) -> str:
     cwd = os.environ.get("PWD") or str(Path.cwd())
     git_root = _git_root_for_path(cwd)
@@ -2085,6 +2185,12 @@ def session_start_context(
             f" Cached session readiness is `{readiness.get('overall', 'unknown')}`; "
             "run `agent code preflight work` before authenticated source work."
         )
+    update_result = update or {}
+    revision = str(update_result.get("local_revision") or bridge_revision(BRIDGE_DIR.parent))[:12] or "unknown"
+    update_text = (
+        f" Agent Bridge revision: `{revision}`; startup refresh: "
+        f"`{update_result.get('status', 'unknown')}`."
+    )
     return (
         "Agent Bridge session bootstrap: global command `agent` is available for bounded local "
         "agent coordination. Use `agent code bridge` for one-shot headless review/code turns and "
@@ -2092,9 +2198,10 @@ def session_start_context(
         "which falls back to one analysis-only adversarial agent unless the task is concrete enough "
         "for a full builder/critic/verifier spawn. Mailbox MCP, when registered, should point to "
         f"`{BRIDGE_DIR / 'mailbox_mcp.py'}`. Use `agent code harness status` to inspect shared "
-        f"OneDrive harness registrations. This startup hook never spawns agents or performs network calls. "
+        "OneDrive harness registrations. This startup hook never spawns agents or mutates the active project; "
+        "its bounded updater only fast-forwards a clean canonical Agent Bridge checkout. "
         f"Client: {client}. Surface: {surface}."
-        f"{location}{registry}{readiness_text}"
+        f"{location}{update_text}{registry}{readiness_text}"
     )
 
 
@@ -2104,8 +2211,60 @@ def hook_session_start(argv: list[str]) -> int:
     parser.add_argument("--surface", default="auto", help="cli, gui, local-api, bridge, or auto detection")
     parser.add_argument("--startup-mechanism", default="native-session-hook")
     parser.add_argument("--plain", action="store_true", help="Print plain context instead of hook JSON")
+    parser.add_argument("--skip-update", action="store_true", help="Skip the automatic refresh for this invocation.")
+    parser.add_argument(
+        "--update-timeout",
+        type=int,
+        default=int(os.environ.get("AGENT_BRIDGE_UPDATE_TIMEOUT", DEFAULT_TIMEOUT_SECONDS)),
+    )
+    parser.add_argument(
+        "--update-interval-seconds",
+        type=int,
+        default=int(os.environ.get("AGENT_BRIDGE_UPDATE_INTERVAL_SECONDS", DEFAULT_INTERVAL_SECONDS)),
+    )
     args = parser.parse_args(argv)
     surface = infer_surface(args.client) if args.surface == "auto" else safe_fragment(args.surface)
+    repo = Path(os.environ.get("AGENT_BRIDGE_REPO", str(BRIDGE_DIR.parent)))
+    if args.skip_update:
+        update = dict(load_update_state()) if os.environ.get("AGENT_BRIDGE_UPDATE_REEXEC") == "1" else {}
+        update.update(
+            {
+                "status": update.get("status", "skipped"),
+                "local_revision": update.get("local_revision") or bridge_revision(repo),
+            }
+        )
+    else:
+        try:
+            update = update_bridge(
+                repo,
+                action="apply",
+                interval_seconds=max(0, args.update_interval_seconds),
+                timeout=max(1, args.update_timeout),
+                expected_remote=os.environ.get("AGENT_BRIDGE_EXPECTED_REMOTE", DEFAULT_EXPECTED_REMOTE),
+            )
+        except Exception as exc:
+            update = {
+                "status": "error",
+                "local_revision": bridge_revision(repo),
+                "detail": f"startup refresh failed safely: {type(exc).__name__}",
+            }
+        if update.get("reexec_required") and os.environ.get("AGENT_BRIDGE_UPDATE_REEXEC") != "1":
+            env = dict(os.environ)
+            env["AGENT_BRIDGE_UPDATE_REEXEC"] = "1"
+            os.execve(
+                sys.executable,
+                [
+                    sys.executable,
+                    "-m",
+                    "agent_bridge.cli",
+                    "code",
+                    "hook",
+                    "session-start",
+                    *argv,
+                    "--skip-update",
+                ],
+                env,
+            )
     registration = maybe_register_harness(args.client, surface=surface, startup_mechanism=args.startup_mechanism)
     try:
         readiness = run_preflight(
@@ -2118,7 +2277,13 @@ def hook_session_start(argv: list[str]) -> int:
         )
     except (OSError, ValueError):
         readiness = None
-    context = session_start_context(args.client, surface=surface, registration=registration, readiness=readiness)
+    context = session_start_context(
+        args.client,
+        surface=surface,
+        registration=registration,
+        readiness=readiness,
+        update=update,
+    )
     if args.plain:
         print(context)
     else:
@@ -2374,6 +2539,9 @@ def hooks_cmd(argv: list[str]) -> int:
                 "registration_age_seconds": registration.get("age_seconds") if registration else None,
                 "registration_machine_id": registration.get("machine_id", "") if registration else "",
                 "registration_project": registration.get("git_root", "") if registration else "",
+                "registration_bridge_revision": registration.get("bridge_revision", "") if registration else "",
+                "registration_deployed_revision": registration.get("deployed_revision", "") if registration else "",
+                "registration_update_status": registration.get("update_status", "") if registration else "",
             }
         )
     result = {"schema_version": manifest.get("schema_version", "1.0"), "hooks": rows}
@@ -2392,12 +2560,12 @@ def harness_cmd(argv: list[str]) -> int:
 
     install = sub.add_parser("install-skill", help="Install the shared Agent Bridge skill package.")
     install.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
-    install.add_argument("--link-client", choices=["none", "codex", "claude", "agents", "all"], default="all")
+    install.add_argument("--link-client", choices=["none", "codex", "claude", "grok", "agents", "all"], default="all")
     install.add_argument("--check", action="store_true", help="Report skill/symlink drift without writing anything.")
     install.add_argument("--json", action="store_true")
 
     register = sub.add_parser("register", help="Write a shared registry heartbeat for this harness.")
-    register.add_argument("--client", required=True, help="Harness/client name, e.g. codex, claude, cursor, aider.")
+    register.add_argument("--client", required=True, help="Harness/client name, e.g. codex, grok, ollama.")
     register.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
     register.add_argument("--status", default="active")
     register.add_argument("--surface", default="", help="cli, gui, local-api, bridge, or another surface id")
@@ -3277,6 +3445,8 @@ def main(argv: list[str]) -> int:
         return cache_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "optimize":
         return optimize_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "update":
+        return update_cmd(argv[2:])
     if len(argv) >= 3 and argv[0] == "code" and argv[1] == "hook" and argv[2] == "session-start":
         return hook_session_start(argv[3:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "hooks":
@@ -3303,6 +3473,7 @@ def main(argv: list[str]) -> int:
     print("       agent code usage --run-id <id> [options]", file=sys.stderr)
     print("       agent code cache <key|put|get> [options]", file=sys.stderr)
     print("       agent code optimize <route|cacheability|compress> [options]", file=sys.stderr)
+    print("       agent code update <status|check|apply> [options]", file=sys.stderr)
     print("       agent code hook session-start [options]", file=sys.stderr)
     print("       agent code hooks <install|status> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)

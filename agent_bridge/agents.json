@@ -36,7 +36,7 @@
         "plain",
         "--disable-web-search",
         "--max-turns",
-        "1"
+        "16"
       ],
       "code_args": [
         "-p",

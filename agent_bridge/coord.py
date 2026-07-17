@@ -814,17 +814,29 @@ def run_doctor(
             else:
                 check(f"skill_link:{client_dir.parent.name}", False, f"{link} exists but is not a symlink")
 
-    for settings_path in (Path.home() / ".claude" / "settings.json", Path.home() / ".codex" / "config.toml"):
-        if not settings_path.exists():
-            check(f"hook_config:{settings_path.parent.name}", None, f"{settings_path} not present")
+    hook_configs = (
+        (".claude", (Path.home() / ".claude" / "settings.json",)),
+        (".codex", (Path.home() / ".codex" / "hooks.json", Path.home() / ".codex" / "config.toml")),
+        (".grok", (Path.home() / ".grok" / "hooks" / "agent-bridge.json", Path.home() / ".grok" / "config.toml")),
+    )
+    for name, candidates in hook_configs:
+        present = [path for path in candidates if path.exists()]
+        if not present:
+            check(f"hook_config:{name}", None, f"{candidates[0]} not present")
             continue
-        try:
-            text = settings_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            check(f"hook_config:{settings_path.parent.name}", False, str(exc))
-            continue
-        ok = "session-start" in text or "sessionstart" in text.lower()
-        check(f"hook_config:{settings_path.parent.name}", ok, "session-start hook command found" if ok else "no session-start hook command found")
+        ok = False
+        detail = "no session-start hook command found"
+        for settings_path in present:
+            try:
+                text = settings_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                detail = str(exc)
+                continue
+            if "session-start" in text or "sessionstart" in text.lower():
+                ok = True
+                detail = f"session-start hook command found ({settings_path})"
+                break
+        check(f"hook_config:{name}", ok, detail)
 
     failures = sum(1 for row in checks if row["status"] == "fail")
     return {"schema_version": SCHEMA_VERSION, "generated_at": iso_now(), "ok": failures == 0, "failures": failures, "checks": checks}

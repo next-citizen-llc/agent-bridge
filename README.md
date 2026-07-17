@@ -73,23 +73,28 @@ The mailbox tools are:
 
 ## Configure Session Hooks
 
-Install lightweight SessionStart hooks for both Codex and Claude:
+Install lightweight SessionStart hooks and startup wrappers for active harness surfaces:
 
 ```bash
-agent code hooks install --client both
+agent code hooks install --client all
 ```
 
 The hook injects a short reminder that Agent Bridge is available, points agents at the global
 mailbox MCP path, and notes that `agent code loop` uses the auto dispatch gate. If a shared
 OneDrive `SharedAgentSkills/Agent-Bridge` folder is available, it also writes a small JSON
-heartbeat for the current harness. It does not spawn agents, run network calls, or mutate project
-files during session startup.
+heartbeat for the current client and surface. It does not prove authentication, spawn agents, run
+network calls, or mutate project files during session startup. Claude remains declared but is
+inactive by default; install it explicitly with `--client claude` when needed.
 
 Check hook status:
 
 ```bash
-agent code hooks status --client both
+agent code hooks status --client all --json
 ```
+
+The surface manifest also defines wrappers for harnesses without native lifecycle hooks. See
+[`docs/readiness-and-context.md`](docs/readiness-and-context.md) for the exact native, wrapper,
+service-probe, and unsupported states.
 
 Install or refresh the shared Agent Bridge skill package and link it into local harness skill
 roots:
@@ -206,6 +211,23 @@ fresh row means that a harness on that machine recently started or resumed and c
 shared folder. It does not prove that an existing UI session is idle, authenticated, or ready to
 accept work.
 
+Run a cache-safe session check or a deeper authenticated work check:
+
+```bash
+agent code preflight session --client codex --surface gui
+agent code preflight work --client grok --surface bridge --expected-github-login YOUR_LOGIN
+agent code preflight work --client ollama --surface local-api --expected-github-login YOUR_LOGIN
+```
+
+Bridge and loop dispatches use cache-first bounded work preflight. Blocked required checks refuse
+code dispatch; degraded reviews continue with a traced warning. Use `--require-ready` for a strict
+all-green gate, `--refresh-readiness` for a bounded live refresh, or `--no-preflight` for an
+explicit traced operator override. Readiness reports distinguish client/surface/machine/project
+and use typed failures for auth, MCP, network, configuration, context, and source problems.
+Generate harness context files from a private canonical manifest with `agent code context install`,
+detect drift and overlaps with `agent code context check`, and use `--force` only after reviewing a
+stale generated block.
+
 Run portable deep research with a consistent command and output shape:
 
 ```bash
@@ -259,6 +281,9 @@ SharedAgentSkills/
 
 Root discovery checks `AGENT_BRIDGE_SHARED_SKILLS_ROOT`, `SHARED_AGENT_SKILLS_ROOT`,
 `CAREER_SHARED_SKILLS_ROOT`, OneDrive environment variables, then the platform defaults.
+`SharedAgentData` and `SharedAgentConversations` are resolved independently. Configure a durable,
+explicit split mapping with `agent code preflight roots` and its `--set-skills`, `--set-data`, and
+`--set-conversations` options.
 
 To copy Codex Desktop sessions and sidebar workspaces between machines, use
 [`docs/codex-sidebar-state-sync.md`](docs/codex-sidebar-state-sync.md).

@@ -9,19 +9,22 @@ coding-agent CLIs (Claude Code, Codex, Grok, Anti-Gravity) from any project on t
 not a daemon and does not attach to running UI sessions — every operation is a fresh one-shot
 headless turn or an append to shared on-disk state.
 
-Three surfaces:
+Four surfaces:
 - **Bridge** (`agent code bridge`) — invoke one fresh headless turn of a target agent CLI for
   `review` or `code` work against a git worktree.
 - **Mailbox MCP** (`agent_bridge/mailbox_mcp.py`) — a small shared mailbox + findings/verdicts store
   exposed as MCP tools for async handoff between agents.
 - **Workflow engine** (`agent workflow`) — portable, structured multi-phase workflows run through a
   configured agent engine (e.g. `deep-research-lite`).
+- **Session recovery** (`agent code sessions`) — inventory local native-session evidence and stage
+  bounded, redacted continuation handoffs without importing one product's chat history into another.
 
 ## Commands
 
 ```bash
 # Run the CLI from a checkout without installing (sets PYTHONPATH, execs the module)
 bin/agent code bridge --list
+bin/agent code sessions inventory --since-hours 168
 
 # Dev checks (README-sanctioned; no third-party test runner)
 python3 -m py_compile agent_bridge/*.py
@@ -61,7 +64,7 @@ per-verb function (`bridge`, `loop`, `repair_cmd`, `workflow_cmd`, `harness_cmd`
 functions builds *its own* `argparse` parser locally. **To add a command:** add a prefix branch in
 `main()`, add a matching usage line in the `main()` help block, and write a `*_cmd`/verb function
 that owns its argument parsing. `bin/agent` and `main_entry()` are the only entry points;
-`main_entry` catches `BridgeError`/`WorkflowError`/`ValueError` and exits 2.
+`main_entry` catches `BridgeError`/`SessionRecoveryError`/`WorkflowError`/`ValueError` and exits 2.
 
 ### Agents are declarative; adapters are the extension point
 `agent_bridge/agents.json` defines each target agent with an `adapter` and a `command`
@@ -81,6 +84,11 @@ queue. `mailbox.py` (CLI mailbox) and `mailbox_mcp.py` (MCP server) read/write t
 `mailbox/messages.jsonl` so the shell tools and MCP interoperate. `findings.py` and `trace.py` back
 `finding_*`/`verdict_*`/`trace_events`. Every module independently resolves the state dir with the
 same `AGENT_BRIDGE_STATE_DIR` env pattern — keep that consistent if you add one.
+
+`session_recovery.py` reads allowlisted metadata plus bounded user/assistant text from local Claude
+indexes, stores private handoffs under `session-recovery/<run_id>/`, and optionally attaches them to
+the task ledger. It must not copy raw transcripts, system prompts, account metadata, or tool-result
+dumps into a recovery bundle.
 
 ### mailbox_mcp.py is a raw JSON-RPC stdio loop
 No SDK. It implements `initialize`, `notifications/initialized`, `tools/list`, `tools/call` by hand

@@ -2,12 +2,14 @@
 
 Global local bridge for bounded collaboration between coding agents from any project.
 
-The bridge has two surfaces:
+The bridge has four surfaces:
 
 - `agent code bridge` invokes a fresh headless turn of a configured agent CLI for review or
   local coding work.
 - `mailbox_mcp.py` exposes a small shared mailbox as MCP tools for async handoff.
 - `agent workflow` runs portable, structured workflows through configured agent engines.
+- `agent code sessions` inventories native Claude session evidence and stages bounded continuation
+  handoffs without importing chat history.
 
 The bridge is local developer infrastructure. It is not a daemon and it does not attach to
 existing UI sessions.
@@ -282,6 +284,26 @@ agent code findings create --run-id run_... --severity high --claim "..."
 agent code verdicts record --run-id run_... --status fail --summary "..."
 ```
 
+Recover unfinished work when a native harness reaches a usage or API limit:
+
+```bash
+agent code sessions inventory --since-hours 168
+agent code sessions recover \
+  --from claude \
+  --to codex \
+  --continue local_source_session_id \
+  --project local_source_session_id=/absolute/path/to/exact/worktree \
+  --verify-github \
+  --enqueue
+```
+
+Inventory is metadata-only. Recovery writes bounded, credential-redacted handoffs under private
+Agent Bridge state and can create an idempotent durable task for each unfinished source session.
+It does not import native chat history or claim that a Codex/Claude UI task was created. Review the
+live source sidebar first, mark proven completed sessions with `--complete`, then create or claim one
+isolated target task per continuation. See
+[`docs/active-session-recovery.md`](docs/active-session-recovery.md).
+
 ## State
 
 Runtime state is outside repositories:
@@ -293,6 +315,7 @@ Runtime state is outside repositories:
   findings.jsonl
   verdicts.jsonl
   transcripts/
+  session-recovery/<run_id>/
   mailbox/messages.jsonl
 ```
 

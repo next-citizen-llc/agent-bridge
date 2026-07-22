@@ -84,6 +84,17 @@ from .readiness import (
     resolve_shared_roots,
     run_preflight,
 )
+from .session_recovery import (
+    DEFAULT_CLAUDE_DATA_ROOT,
+    DEFAULT_CLAUDE_PROJECTS_ROOT,
+    SessionRecoveryError,
+    discover_claude_sessions,
+    filter_sessions,
+    format_recovery_result,
+    format_session_inventory,
+    load_recovery_selection,
+    recover_sessions,
+)
 from .trace import emit_event, events_path, format_events, load_events
 from .updater import (
     DEFAULT_EXPECTED_REMOTE,
@@ -1882,7 +1893,7 @@ def repair_cmd(argv: list[str]) -> int:
 def render_agent_bridge_skill() -> str:
     return f"""---
 name: agent-bridge
-description: Use when coordinating Codex, Claude, or other coding harnesses through Agent Bridge; checking shared OneDrive harness status; registering a harness heartbeat; using mailbox MCP; or invoking agent code bridge, loop, workflow, hooks, or harness commands across macOS and Windows machines.
+description: Use when coordinating Codex, Claude, or other coding harnesses through Agent Bridge; recovering interrupted native sessions after usage or API limits; checking shared OneDrive harness status; registering a harness heartbeat; using mailbox MCP; or invoking agent code bridge, loop, workflow, hooks, or harness commands across macOS and Windows machines.
 ---
 
 # Agent Bridge
@@ -1912,6 +1923,14 @@ Use the installed `agent` command as the front door for local and cross-harness 
 - Use `agent code bridge --mode code` only for scoped implementation tasks with an explicit worktree.
 - Use `agent code loop` for adversarial builder/critic/verifier loops; keep budgets explicit when cost matters.
 - Use mailbox MCP for async handoffs. Mailbox messages are the durable proof path; shell process lifetime is secondary.
+
+## Active Session Recovery
+
+- When one harness hits a usage or API limit, start with `agent code sessions inventory` to reconcile its native metadata and transcript pointers.
+- Use `agent code sessions recover --continue <session-id> --to codex --enqueue` only after reviewing which sessions are genuinely unfinished. Mark proven completed sessions with `--complete` so they are recorded but not duplicated.
+- Recovery artifacts stay under `{STATE_DIR / 'session-recovery'}`. They contain bounded, credential-redacted context and pointers to native evidence, never copied raw transcripts.
+- A recovery task is a durable handoff, not proof that a native target chat was created. The target harness must create or claim one isolated task per handoff and preserve the exact project/worktree.
+- Re-verify Git, pull-request, artifact, and other live state before continuing. Use `--verify-github` when GitHub PR evidence is part of completion classification.
 
 ## Readiness and Context
 
@@ -3069,6 +3088,151 @@ def optimize_cmd(argv: list[str]) -> int:
     return 0
 
 
+def _project_overrides(values: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise SessionRecoveryError("--project must use SESSION_ID=PATH")
+        session_id, path = value.split("=", 1)
+        session_id = session_id.strip()
+        path = path.strip()
+        if not session_id or not path:
+            raise SessionRecoveryError("--project must use SESSION_ID=PATH")
+        if session_id in result and result[session_id] != str(Path(path).expanduser()):
+            raise SessionRecoveryError(f"conflicting --project overrides for session {session_id}")
+        result[session_id] = str(Path(path).expanduser())
+    return result
+
+
+def sessions_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agent code sessions",
+        description="Inventory native harness sessions and stage evidence-first continuation handoffs.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    inventory = sub.add_parser("inventory", help="List recent local Claude sessions without copying message bodies.")
+    inventory.add_argument(
+        "--claude-data-root",
+        default=os.environ.get("AGENT_BRIDGE_CLAUDE_DATA_ROOT", str(DEFAULT_CLAUDE_DATA_ROOT)),
+    )
+    inventory.add_argument(
+        "--claude-projects-root",
+        default=os.environ.get("AGENT_BRIDGE_CLAUDE_PROJECTS_ROOT", str(DEFAULT_CLAUDE_PROJECTS_ROOT)),
+    )
+    inventory.add_argument("--since-hours", type=float, default=168.0)
+    inventory.add_argument("--all-time", action="store_true", help="Do not filter by last activity time.")
+    inventory.add_argument("--include-archived", action="store_true")
+    inventory.add_argument("--session-id", action="append", default=[])
+    inventory.add_argument("--title", default="", help="Case-insensitive title substring.")
+    inventory.add_argument("--limit", type=int, default=50)
+    inventory.add_argument("--json", action="store_true")
+
+    recover = sub.add_parser(
+        "recover",
+        help="Stage private handoffs for unfinished sessions and record completed sessions without duplicating them.",
+    )
+    recover.add_argument("--from", dest="source", choices=["claude"], default="claude")
+    recover.add_argument("--to", dest="target", default="codex")
+    recover.add_argument("--continue", dest="continue_ids", action="append", default=[])
+    recover.add_argument(
+        "--complete",
+        dest="complete_ids",
+        action="append",
+        default=[],
+        help="Operator-confirmed completed session; record evidence but do not create a continuation.",
+    )
+    recover.add_argument(
+        "--selection",
+        help="JSON file with sessions containing session_id, disposition continue|complete, and optional project_dir.",
+    )
+    recover.add_argument(
+        "--project",
+        action="append",
+        default=[],
+        metavar="SESSION_ID=PATH",
+        help="Override the exact project/worktree for one source session.",
+    )
+    recover.add_argument(
+        "--claude-data-root",
+        default=os.environ.get("AGENT_BRIDGE_CLAUDE_DATA_ROOT", str(DEFAULT_CLAUDE_DATA_ROOT)),
+    )
+    recover.add_argument(
+        "--claude-projects-root",
+        default=os.environ.get("AGENT_BRIDGE_CLAUDE_PROJECTS_ROOT", str(DEFAULT_CLAUDE_PROJECTS_ROOT)),
+    )
+    recover.add_argument("--verify-github", action="store_true", help="Read current PR state with the authenticated gh CLI.")
+    recover.add_argument(
+        "--enqueue",
+        action="store_true",
+        help="Create idempotent Agent Bridge task-ledger entries for continuation handoffs.",
+    )
+    recover.add_argument("--context-messages", type=int, default=8)
+    recover.add_argument("--context-chars", type=int, default=12_000)
+    recover.add_argument("--output-root", help="Private recovery artifact root. Defaults under Agent Bridge state.")
+    recover.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    data_root = Path(args.claude_data_root).expanduser()
+    projects_root = Path(args.claude_projects_root).expanduser()
+    sessions = discover_claude_sessions(data_root=data_root, projects_root=projects_root)
+
+    if args.cmd == "inventory":
+        rows = filter_sessions(
+            sessions,
+            session_ids=args.session_id,
+            since_hours=None if args.all_time else args.since_hours,
+            include_archived=args.include_archived,
+            title=args.title,
+            limit=args.limit,
+        )
+        _json_print(rows) if args.json else print(format_session_inventory(rows), end="")
+        return 0
+
+    decisions: dict[str, str] = {}
+    projects: dict[str, str] = {}
+    if args.selection:
+        selected_decisions, selected_projects = load_recovery_selection(Path(args.selection).expanduser())
+        decisions.update(selected_decisions)
+        projects.update(selected_projects)
+    for disposition, session_ids in (("continue", args.continue_ids), ("complete", args.complete_ids)):
+        for session_id in session_ids:
+            session_id = session_id.strip()
+            if not session_id:
+                raise SessionRecoveryError("session ids must not be empty")
+            existing = decisions.get(session_id)
+            if existing and existing != disposition:
+                raise SessionRecoveryError(f"conflicting dispositions for session {session_id}")
+            decisions[session_id] = disposition
+    projects.update(_project_overrides(args.project))
+    unknown_projects = sorted(set(projects) - set(decisions))
+    if unknown_projects:
+        raise SessionRecoveryError(
+            "project overrides require a matching continue/complete decision: " + ", ".join(unknown_projects)
+        )
+    selected = filter_sessions(
+        sessions,
+        session_ids=decisions,
+        since_hours=None,
+        include_archived=True,
+        limit=None,
+    )
+    result = recover_sessions(
+        selected,
+        decisions=decisions,
+        source=args.source,
+        target=args.target,
+        project_overrides=projects,
+        verify_github=args.verify_github,
+        enqueue=args.enqueue,
+        context_messages=max(0, args.context_messages),
+        context_chars=max(0, args.context_chars),
+        output_root=Path(args.output_root).expanduser() if args.output_root else None,
+    )
+    _json_print(result) if args.json else print(format_recovery_result(result), end="")
+    return 0
+
+
 def workflow_cmd(argv: list[str]) -> int:
     global PROJECT_DIR
     parser = argparse.ArgumentParser(prog="agent workflow", description="Run portable workflows across configured agent engines.")
@@ -3453,6 +3617,8 @@ def main(argv: list[str]) -> int:
         return hooks_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "harness":
         return harness_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "sessions":
+        return sessions_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "preflight":
         return preflight_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "context":
@@ -3477,6 +3643,7 @@ def main(argv: list[str]) -> int:
     print("       agent code hook session-start [options]", file=sys.stderr)
     print("       agent code hooks <install|status> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
+    print("       agent code sessions <inventory|recover> [options]", file=sys.stderr)
     print("       agent code preflight <session|work|status|publish|flush|aggregate|roots|configure> [options]", file=sys.stderr)
     print("       agent code context <install|check|status> --manifest PATH [options]", file=sys.stderr)
     print("       agent code doctor [options]", file=sys.stderr)
@@ -3494,7 +3661,7 @@ def main(argv: list[str]) -> int:
 def main_entry() -> None:
     try:
         raise SystemExit(main(sys.argv[1:]))
-    except (BridgeError, WorkflowError, ValueError) as exc:
+    except (BridgeError, SessionRecoveryError, WorkflowError, ValueError) as exc:
         print(f"agent: {exc}", file=sys.stderr)
         raise SystemExit(2)
 
@@ -3502,6 +3669,6 @@ def main_entry() -> None:
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
-    except (BridgeError, WorkflowError, ValueError) as exc:
+    except (BridgeError, SessionRecoveryError, WorkflowError, ValueError) as exc:
         print(f"agent: {exc}", file=sys.stderr)
         raise SystemExit(2)

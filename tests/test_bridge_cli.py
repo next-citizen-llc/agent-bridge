@@ -968,7 +968,11 @@ class BridgeCliTests(unittest.TestCase):
         self.assertEqual({row["surface"] for row in rows}, {"cli", "gui"})
         self.assertEqual(next(row for row in rows if row["surface"] == "cli")["status"], "installed")
         self.assertEqual(next(row for row in rows if row["surface"] == "gui")["status"], "installed")
-        self.assertIn("Microsoft Edge", wrapper_text)
+        self.assertIn("https://grok.com/", wrapper_text)
+        if sys.platform == "darwin":
+            self.assertIn("Microsoft Edge", wrapper_text)
+        else:
+            self.assertRegex(wrapper_text, r"exec .*(microsoft-edge|xdg-open)")
 
     def test_hooks_uninstall_preserves_modified_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -46,7 +46,9 @@ jobs:
           }
 
           $agents = & (Join-Path $binDir "agent.cmd") code bridge --list
-          if ($LASTEXITCODE -ne 0 -or $agents -notmatch "codex") {
+          $agentExitCode = $LASTEXITCODE
+          $agentOutput = $agents -join "`n"
+          if ($agentExitCode -ne 0 -or $agentOutput -notmatch "codex") {
               throw "installed launcher did not list configured adapters"
           }
 

@@ -2361,6 +2361,45 @@ def _ensure_command_hook(config: dict[str, Any], command: str) -> bool:
     return True
 
 
+def _remove_command_hook(config: dict[str, Any], command: str) -> bool:
+    hooks_config = config.get("hooks")
+    if not isinstance(hooks_config, dict):
+        return False
+    entries = hooks_config.get("SessionStart")
+    if not isinstance(entries, list):
+        return False
+    changed = False
+    retained_entries: list[Any] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            retained_entries.append(entry)
+            continue
+        retained_hooks = [
+            hook
+            for hook in entry["hooks"]
+            if not (
+                isinstance(hook, dict)
+                and hook.get("type") == "command"
+                and hook.get("command") == command
+            )
+        ]
+        removed_here = len(retained_hooks) != len(entry["hooks"])
+        changed = changed or removed_here
+        if (
+            removed_here
+            and not retained_hooks
+            and entry.get("matcher") == "startup|resume"
+            and set(entry).issubset({"matcher", "hooks"})
+        ):
+            continue
+        retained_entry = dict(entry)
+        retained_entry["hooks"] = retained_hooks
+        retained_entries.append(retained_entry)
+    if changed:
+        hooks_config["SessionStart"] = retained_entries
+    return changed
+
+
 def _config_path(client: str) -> Path:
     home = Path.home()
     if client == "codex":
@@ -2377,6 +2416,17 @@ def install_session_hook(client: str) -> bool:
     default = {"hooks": {}}
     config = _load_json_config(path, default)
     changed = _ensure_command_hook(config, _hook_agent_command(client))
+    if changed:
+        _write_json_config(path, config)
+    return changed
+
+
+def uninstall_session_hook(client: str) -> bool:
+    path = _config_path(client)
+    if not path.exists():
+        return False
+    config = _load_json_config(path, {})
+    changed = _remove_command_hook(config, _hook_agent_command(client))
     if changed:
         _write_json_config(path, config)
     return changed
@@ -2456,6 +2506,20 @@ def install_surface_wrapper(surface: dict[str, Any]) -> bool:
     return True
 
 
+def uninstall_surface_wrapper(surface: dict[str, Any]) -> str:
+    path = _surface_config_path(surface)
+    if not path.exists():
+        return "not-installed"
+    try:
+        current = path.read_text(encoding="utf-8")
+    except OSError:
+        return "modified-preserved"
+    if current != _wrapper_text(surface):
+        return "modified-preserved"
+    path.unlink()
+    return "removed"
+
+
 def surface_hook_installed(surface: dict[str, Any]) -> bool:
     mechanism = surface.get("startup_mechanism")
     if mechanism == "native-session-hook":
@@ -2470,12 +2534,18 @@ def surface_hook_installed(surface: dict[str, Any]) -> bool:
 
 
 def hooks_cmd(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="agent code hooks", description="Install or inspect Agent Bridge session hooks.")
+    parser = argparse.ArgumentParser(
+        prog="agent code hooks",
+        description="Install, uninstall, or inspect Agent Bridge session hooks.",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
     install = sub.add_parser("install")
     install.add_argument("--client", default="all", help="codex, claude, grok, both, or all")
     install.add_argument("--include-inactive", action="store_true", help="Include surfaces disabled by default, such as Claude")
     install.add_argument("--json", action="store_true")
+    uninstall = sub.add_parser("uninstall")
+    uninstall.add_argument("--client", default="all", help="client name, both, or all")
+    uninstall.add_argument("--json", action="store_true")
     status = sub.add_parser("status")
     status.add_argument("--client", default="all", help="client name, both, or all")
     status.add_argument("--json", action="store_true")
@@ -2525,6 +2595,45 @@ def hooks_cmd(argv: list[str]) -> int:
                 path = f" ({row['config_path']})" if row.get("config_path") else ""
                 print(f"{row['client']}: {row['status']}{path}")
         return 0
+    if args.cmd == "uninstall":
+        rows = []
+        for client in clients:
+            client_surfaces = [row for row in manifest["surfaces"] if row.get("client") == client]
+            native_changed: bool | None = None
+            for surface in client_surfaces:
+                if not surface.get("installable"):
+                    rows.append(
+                        {
+                            "client": client,
+                            "surface": surface["surface"],
+                            "status": surface.get("startup_mechanism", "unsupported"),
+                            "changed": False,
+                        }
+                    )
+                    continue
+                mechanism = surface.get("startup_mechanism")
+                if mechanism == "native-session-hook":
+                    if native_changed is None:
+                        native_changed = uninstall_session_hook(client)
+                    status_value = "removed" if native_changed else "not-installed"
+                else:
+                    status_value = uninstall_surface_wrapper(surface)
+                rows.append(
+                    {
+                        "client": client,
+                        "surface": surface["surface"],
+                        "status": status_value,
+                        "changed": status_value == "removed",
+                        "config_path": str(_surface_config_path(surface)),
+                    }
+                )
+        if args.json:
+            _json_print({"schema_version": manifest.get("schema_version", "1.0"), "hooks": rows})
+        else:
+            for row in rows:
+                path = f" ({row['config_path']})" if row.get("config_path") else ""
+                print(f"{row['client']}: {row['status']}{path}")
+        return 1 if any(row["status"] == "modified-preserved" for row in rows) else 0
     try:
         registry_rows = load_harness_registry(stale_minutes=1440).get("harnesses", [])
     except (BridgeError, OSError, AssertionError):
@@ -3641,7 +3750,7 @@ def main(argv: list[str]) -> int:
     print("       agent code optimize <route|cacheability|compress> [options]", file=sys.stderr)
     print("       agent code update <status|check|apply> [options]", file=sys.stderr)
     print("       agent code hook session-start [options]", file=sys.stderr)
-    print("       agent code hooks <install|status> [options]", file=sys.stderr)
+    print("       agent code hooks <install|uninstall|status> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
     print("       agent code sessions <inventory|recover> [options]", file=sys.stderr)
     print("       agent code preflight <session|work|status|publish|flush|aggregate|roots|configure> [options]", file=sys.stderr)

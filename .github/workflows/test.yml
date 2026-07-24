@@ -1,0 +1,56 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - run: python -m py_compile agent_bridge/*.py
+      - run: python -m unittest discover -s tests
+
+  windows-installer:
+    name: Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Install, invoke, and uninstall in an isolated home
+        shell: pwsh
+        run: |
+          $testHome = Join-Path $env:RUNNER_TEMP "agent-bridge-home"
+          $binDir = Join-Path $testHome ".local\bin"
+          New-Item -ItemType Directory -Force -Path $testHome | Out-Null
+          $env:HOME = $testHome
+
+          .\scripts\install.ps1 -ProjectDir $PWD.Path -BinDir $binDir
+          if (-not (Test-Path (Join-Path $binDir "agent.cmd"))) {
+              throw "agent.cmd was not installed"
+          }
+
+          $agents = & (Join-Path $binDir "agent.cmd") code bridge --list
+          if ($LASTEXITCODE -ne 0 -or $agents -notmatch "codex") {
+              throw "installed launcher did not list configured adapters"
+          }
+
+          .\scripts\uninstall.ps1 -ProjectDir $PWD.Path -BinDir $binDir
+          if (Test-Path (Join-Path $binDir "agent.cmd")) {
+              throw "agent.cmd was not removed"
+          }

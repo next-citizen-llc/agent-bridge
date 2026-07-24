@@ -1,9 +1,11 @@
 param(
     [string]$ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
     [string]$BinDir = (Join-Path $HOME ".local\bin"),
+    [switch]$InstallHooks,
+    [switch]$UpdatePath,
     [switch]$SkipPathUpdate,
-    [switch]$SkipHooks,
-    [switch]$RegisterMcp
+    [switch]$RegisterMcp,
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,9 +26,23 @@ if %ERRORLEVEL%==0 (
   python -m agent_bridge.cli %*
 )
 "@
-Set-Content -Path $AgentCmd -Value $cmd -Encoding ASCII
 
-if (-not $SkipPathUpdate) {
+$launcherStatus = "installed"
+if (Test-Path $AgentCmd) {
+    $current = Get-Content -Raw -Path $AgentCmd
+    if ($current.TrimEnd() -eq $cmd.TrimEnd()) {
+        $launcherStatus = "already installed"
+    } elseif (-not $Force) {
+        throw "Refusing to replace existing launcher: $AgentCmd. Inspect it, choose another -BinDir, or rerun with -Force."
+    } else {
+        Set-Content -Path $AgentCmd -Value $cmd -Encoding ASCII
+        $launcherStatus = "replaced by explicit -Force"
+    }
+} else {
+    Set-Content -Path $AgentCmd -Value $cmd -Encoding ASCII
+}
+
+if ($UpdatePath -and -not $SkipPathUpdate) {
     $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $parts = @()
     if ($currentPath) {
@@ -36,14 +52,17 @@ if (-not $SkipPathUpdate) {
         $newPath = if ($currentPath) { "$currentPath;$BinDir" } else { $BinDir }
         [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
         $env:Path = "$env:Path;$BinDir"
-        Write-Host "Added $BinDir to the user PATH. Open a new terminal to inherit it."
+        Write-Host "Added $BinDir to the user PATH by explicit -UpdatePath request."
     }
 }
 
-if (-not $SkipHooks) {
+if ($InstallHooks) {
     $env:AGENT_BRIDGE_HOOK_AGENT = $AgentCmd
     & $AgentCmd code hooks install --client all
     Remove-Item Env:\AGENT_BRIDGE_HOOK_AGENT -ErrorAction SilentlyContinue
+    $hookStatus = "installed by explicit request"
+} else {
+    $hookStatus = "not installed; opt in with: agent code hooks install --client all"
 }
 
 if ($RegisterMcp) {
@@ -75,6 +94,9 @@ if ($RegisterMcp) {
     }
 }
 
-Write-Host "Installed agent command: $AgentCmd"
+Write-Host "Agent launcher: $AgentCmd ($launcherStatus)"
 Write-Host "State directory: $StateDir"
-Write-Host "Run: agent code hooks status --client all"
+Write-Host "Startup hooks: $hookStatus"
+Write-Host "For this shell, if needed: `$env:Path = `"$BinDir;`$env:Path`""
+Write-Host "Persist PATH only by request: .\scripts\install.ps1 -UpdatePath"
+Write-Host "Uninstall: .\scripts\uninstall.ps1"

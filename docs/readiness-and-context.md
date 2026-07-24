@@ -47,8 +47,17 @@ Install active hooks and wrappers with:
 agent code hooks install --client all
 ```
 
-The Unix installer does this by default; set `AGENT_BRIDGE_SKIP_HOOKS=1` to install only the
-global command.
+The platform installers leave hooks and wrappers disabled by default. Opt in with the command above,
+`scripts/install.sh --install-hooks`, or `.\scripts\install.ps1 -InstallHooks`. Installed startup
+hooks also run the bounded Agent Bridge updater when a configured surface starts.
+
+Remove exact Agent Bridge hook and wrapper entries with:
+
+```bash
+agent code hooks uninstall --client all
+```
+
+Modified wrappers are preserved and reported rather than deleted.
 
 Claude is declared but skipped by that command because it is inactive by default. Install it
 explicitly with `agent code hooks install --client claude`, or pass `--include-inactive`.

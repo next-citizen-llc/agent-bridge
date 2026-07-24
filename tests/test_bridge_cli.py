@@ -844,6 +844,72 @@ class BridgeCliTests(unittest.TestCase):
         )
         self.assertEqual(claude["model"], "opus")
 
+    def test_hooks_uninstall_removes_only_agent_bridge_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "HOME": tmp, "AGENT_BRIDGE_HOOK_AGENT": "/tmp/agent"}
+            codex_dir = Path(tmp) / ".codex"
+            claude_dir = Path(tmp) / ".claude"
+            codex_dir.mkdir()
+            claude_dir.mkdir()
+            unrelated = {"type": "command", "command": "/tmp/other-hook"}
+            (codex_dir / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "SessionStart": [
+                                {"matcher": "startup|resume", "hooks": [unrelated]},
+                            ]
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (claude_dir / "settings.json").write_text('{"model":"opus","hooks":{}}\n', encoding="utf-8")
+
+            install = subprocess.run(
+                [str(AGENT), "code", "hooks", "install", "--client", "both"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            uninstall = subprocess.run(
+                [str(AGENT), "code", "hooks", "uninstall", "--client", "both", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            repeat = subprocess.run(
+                [str(AGENT), "code", "hooks", "uninstall", "--client", "both"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            codex = json.loads((codex_dir / "hooks.json").read_text(encoding="utf-8"))
+            claude = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(install.returncode, 0, install.stderr)
+        self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
+        self.assertEqual(repeat.returncode, 0, repeat.stderr)
+        self.assertEqual(
+            codex["hooks"]["SessionStart"][0]["hooks"],
+            [unrelated],
+        )
+        self.assertEqual(claude["hooks"]["SessionStart"], [])
+        self.assertEqual(claude["model"], "opus")
+        statuses = {row["status"] for row in json.loads(uninstall.stdout)["hooks"]}
+        self.assertEqual(statuses, {"removed"})
+        self.assertNotIn("agent-bridge", repeat.stderr)
+
     def test_hooks_install_uses_windows_cmd_wrapper_for_cmd_shim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env = {
@@ -903,6 +969,46 @@ class BridgeCliTests(unittest.TestCase):
         self.assertEqual(next(row for row in rows if row["surface"] == "cli")["status"], "installed")
         self.assertEqual(next(row for row in rows if row["surface"] == "gui")["status"], "installed")
         self.assertIn("Microsoft Edge", wrapper_text)
+
+    def test_hooks_uninstall_preserves_modified_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "HOME": tmp, "AGENT_BRIDGE_HOOK_AGENT": "/tmp/agent"}
+            install = subprocess.run(
+                [str(AGENT), "code", "hooks", "install", "--client", "grok"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            wrapper = Path(tmp) / ".local" / "bin" / "grok-gui-bridge"
+            wrapper.write_text(wrapper.read_text(encoding="utf-8") + "# user edit\n", encoding="utf-8")
+            uninstall = subprocess.run(
+                [str(AGENT), "code", "hooks", "uninstall", "--client", "grok", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            native = Path(tmp) / ".grok" / "hooks" / "agent-bridge.json"
+            config = json.loads(native.read_text(encoding="utf-8"))
+            wrapper_exists = wrapper.exists()
+            wrapper_contents = wrapper.read_text(encoding="utf-8")
+
+        self.assertEqual(install.returncode, 0, install.stderr)
+        self.assertEqual(uninstall.returncode, 1, uninstall.stderr)
+        rows = json.loads(uninstall.stdout)["hooks"]
+        self.assertEqual(next(row for row in rows if row["surface"] == "cli")["status"], "removed")
+        self.assertEqual(
+            next(row for row in rows if row["surface"] == "gui")["status"],
+            "modified-preserved",
+        )
+        self.assertTrue(wrapper_exists)
+        self.assertTrue(wrapper_contents.endswith("# user edit\n"))
+        self.assertEqual(config["hooks"]["SessionStart"], [])
 
     def test_code_dispatch_runs_work_preflight_and_honors_configured_binary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

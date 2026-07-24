@@ -114,7 +114,7 @@ session is idle or ready for work. Treat it as advisory.
 
 ## GitHub identity policy (enforced for this repo)
 
-This repo pushes to `github.com/tristan-nextcz/agent-bridge`. Per the user's global policy: commits
+This repo pushes to `github.com/next-citizen-llc/agent-bridge`. Per the user's global policy: commits
 are authored as Tristan Springmeyer, with **no** agent/assistant attribution — no `Co-Authored-By`
 agent trailers, no "Generated with …" footers in commits/PRs/issues. Keep branch names, PR titles,
 tags, and other repo-visible surfaces neutral and descriptive; never expose agent/tool identity in

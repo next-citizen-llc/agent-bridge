@@ -15,7 +15,7 @@ from typing import Any, Callable
 SCHEMA_VERSION = "1.0"
 DEFAULT_INTERVAL_SECONDS = 300
 DEFAULT_TIMEOUT_SECONDS = 15
-DEFAULT_EXPECTED_REMOTE = "https://github.com/tristan-nextcz/agent-bridge.git"
+DEFAULT_EXPECTED_REMOTE = "https://github.com/next-citizen-llc/agent-bridge.git"
 
 
 def iso_now() -> str:

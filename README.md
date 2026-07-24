@@ -32,7 +32,7 @@ That creates:
 On Windows PowerShell:
 
 ```powershell
-git clone https://github.com/tristan-nextcz/agent-bridge.git $HOME\Code\agent-bridge
+git clone https://github.com/next-citizen-llc/agent-bridge.git $HOME\Code\agent-bridge
 cd $HOME\Code\agent-bridge
 .\scripts\install.ps1
 ```

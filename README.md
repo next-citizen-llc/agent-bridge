@@ -154,6 +154,7 @@ vendor CLI may still be transmitted under that tool's own account, privacy, and 
 
 ## Field notes
 
+- [Context is an operating contract, not a prompt payload](docs/field-notes/context-is-an-operating-contract.md)
 - [Authority should be explicit state, not prompt prose](docs/field-notes/authority-is-state.md)
 - [A failure taxonomy for cross-harness workflows](docs/field-notes/failure-taxonomy.md)
 - [Verifying an agent handoff without sharing private transcripts](docs/field-notes/verifiable-handoffs.md)

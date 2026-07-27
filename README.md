@@ -2,6 +2,9 @@
 
 Local-first CLI and MCP infrastructure for bounded collaboration across coding-agent tools.
 
+Created by [Tristan Springmeyer (`@tristan-nextcz`)](https://github.com/tristan-nextcz) and
+organization-owned by [Next Citizen LLC](https://github.com/next-citizen-llc) for durable governance.
+
 Agent Bridge launches fresh headless turns, records local coordination state, and makes the
 authority of each turn explicit. It does not attach to an existing chat, run as a daemon, or turn
 one product's private conversation history into another product's history.

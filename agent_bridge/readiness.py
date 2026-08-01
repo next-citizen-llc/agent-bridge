@@ -646,7 +646,9 @@ def _overall(checks: list[dict[str, Any]]) -> str:
     required = [row for row in checks if row["required"]]
     if any(row["status"] == "blocked" for row in required):
         return "blocked"
-    if any(row["status"] in {"blocked", "degraded", "unknown"} for row in checks):
+    if any(row["status"] in {"degraded", "unknown"} for row in required):
+        return "degraded"
+    if any(not row["required"] and row["status"] in {"blocked", "degraded"} for row in checks):
         return "degraded"
     return "ready"
 

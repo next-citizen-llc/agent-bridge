@@ -14,6 +14,7 @@ from agent_bridge.readiness import (
     _github_check,
     _mcp_health_checks,
     _ollama_check,
+    _overall,
     _sanitize_detail,
     aggregate_readiness,
     publish_readiness,
@@ -26,6 +27,20 @@ from agent_bridge.readiness import (
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_unknown_advisory_does_not_degrade_operational_readiness(self) -> None:
+        checks = [
+            {"name": "client_binary", "required": True, "status": "ready"},
+            {"name": "mcp_health", "required": False, "status": "unknown"},
+        ]
+        self.assertEqual(_overall(checks), "ready")
+
+    def test_advisory_failure_still_degrades_operational_readiness(self) -> None:
+        checks = [
+            {"name": "client_binary", "required": True, "status": "ready"},
+            {"name": "mcp_health", "required": False, "status": "degraded"},
+        ]
+        self.assertEqual(_overall(checks), "degraded")
+
     def test_auth_success_exit_with_logged_out_message_is_blocked(self) -> None:
         with mock.patch("agent_bridge.readiness._run", return_value=(0, "Not logged in · Please run /login")):
             result = _auth_check("codex", project_dir=Path.cwd(), timeout=1)

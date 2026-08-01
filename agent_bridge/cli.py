@@ -1285,7 +1285,9 @@ def _dispatch_readiness_gate(
     age_seconds = max(0, int((dt.datetime.now(dt.timezone.utc) - generated).total_seconds())) if generated else None
     stale = bool(report.get("stale"))
     overall = "unknown" if stale else str(report.get("overall", "unknown"))
-    refused = (mode == "code" and overall == "blocked") or (require_ready and overall != "ready")
+    checks = report.get("checks", []) if isinstance(report.get("checks"), list) else []
+    strict_ready = not stale and bool(checks) and all(row.get("status") == "ready" for row in checks)
+    refused = (mode == "code" and overall == "blocked") or (require_ready and not strict_ready)
     action = "refuse" if refused else ("warn" if overall != "ready" else "allow")
     decision = {
         "target": target_id,
@@ -1295,13 +1297,18 @@ def _dispatch_readiness_gate(
         "age_seconds": age_seconds,
         "source": source,
         "require_ready": require_ready,
+        "strict_ready": strict_ready,
     }
     emit_event("dispatch.readiness_evaluated", run_id=meta.get("run_id"), meta=meta, data=decision)
     record_run_task("updated", meta=meta, command=command, data={"readiness": decision})
     if refused:
-        blocked = ", ".join(
-            row.get("name", "unknown") for row in report.get("checks", []) if row.get("required") and row.get("status") == "blocked"
-        ) or overall
+        if require_ready:
+            blocked = ", ".join(row.get("name", "unknown") for row in checks if row.get("status") != "ready")
+        else:
+            blocked = ", ".join(
+                row.get("name", "unknown") for row in checks if row.get("required") and row.get("status") == "blocked"
+            )
+        blocked = blocked or overall
         print(
             f"[agent-bridge] readiness refused {target_id} {mode} dispatch: {blocked}. "
             f"Run `agent code preflight work --client {target_id} --surface bridge --refresh` for details, "

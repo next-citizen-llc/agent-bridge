@@ -73,6 +73,32 @@ class BridgeCliTests(unittest.TestCase):
         self.assertTrue(bypassed)
         self.assertEqual(emit.call_args.kwargs["data"]["decision"], "bypass")
 
+    def test_require_ready_refuses_unknown_advisory_even_when_overall_is_ready(self) -> None:
+        report = {
+            "generated_at": "2030-01-01T00:00:00Z",
+            "overall": "ready",
+            "project_dir": str(bridge_cli.PROJECT_DIR),
+            "checks": [
+                {"name": "client_binary", "required": True, "status": "ready"},
+                {"name": "mcp_health", "required": False, "status": "unknown"},
+            ],
+        }
+        with mock.patch.object(bridge_cli, "load_cached_preflight", return_value=report):
+            with mock.patch.object(bridge_cli, "emit_event") as emit:
+                with mock.patch.object(bridge_cli, "record_run_task"):
+                    allowed = bridge_cli._dispatch_readiness_gate(
+                        "codex",
+                        mode="review",
+                        command="bridge",
+                        meta={"run_id": "run_strict"},
+                        no_preflight=False,
+                        require_ready=True,
+                        refresh=False,
+                        timeout=1,
+                    )
+        self.assertFalse(allowed)
+        self.assertFalse(emit.call_args.kwargs["data"]["strict_ready"])
+
     def test_readiness_gate_refreshes_cache_from_another_project(self) -> None:
         cached = {"generated_at": "2030-01-01T00:00:00Z", "overall": "ready", "project_dir": "/different/project", "checks": []}
         live = {"generated_at": "2030-01-01T00:00:01Z", "overall": "ready", "project_dir": str(bridge_cli.PROJECT_DIR), "checks": []}

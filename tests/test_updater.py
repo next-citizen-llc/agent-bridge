@@ -10,12 +10,13 @@ from unittest import mock
 from agent_bridge import updater
 
 
+# Git refuses to commit without an identity; no assertion depends on the value.
 GIT_ENV = {
     **os.environ,
-    "GIT_AUTHOR_NAME": "Tristan Springmeyer",
-    "GIT_AUTHOR_EMAIL": "tristan@nextcz.com",
-    "GIT_COMMITTER_NAME": "Tristan Springmeyer",
-    "GIT_COMMITTER_EMAIL": "tristan@nextcz.com",
+    "GIT_AUTHOR_NAME": "Agent Bridge Test",
+    "GIT_AUTHOR_EMAIL": "test@example.invalid",
+    "GIT_COMMITTER_NAME": "Agent Bridge Test",
+    "GIT_COMMITTER_EMAIL": "test@example.invalid",
 }
 
 
@@ -44,8 +45,8 @@ class UpdaterTests(unittest.TestCase):
         git(self.seed, "push", "-u", "origin", "main")
         git(self.remote, "symbolic-ref", "HEAD", "refs/heads/main")
         subprocess.run(["git", "clone", str(self.remote), str(self.repo)], check=True, stdout=subprocess.DEVNULL)
-        git(self.repo, "config", "user.name", "Tristan Springmeyer")
-        git(self.repo, "config", "user.email", "tristan@nextcz.com")
+        git(self.repo, "config", "user.name", "Agent Bridge Test")
+        git(self.repo, "config", "user.email", "test@example.invalid")
         self.env = mock.patch.dict(
             os.environ,
             {"AGENT_BRIDGE_STATE_DIR": str(self.root / "state")},

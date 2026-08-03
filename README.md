@@ -1,5 +1,10 @@
 # Agent Bridge
 
+[![test](https://github.com/next-citizen-llc/agent-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/next-citizen-llc/agent-bridge/actions/workflows/test.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Runtime dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)](pyproject.toml)
+
 Local-first CLI and MCP infrastructure for bounded collaboration across coding-agent tools.
 
 Created by [Tristan Springmeyer (`@tristan-nextcz`)](https://github.com/tristan-nextcz) and
@@ -172,6 +177,13 @@ python3 -m unittest discover -s tests
 
 Runtime state is stored outside the repository under `~/.local/state/agent-bridge/` by default. Set
 `AGENT_BRIDGE_STATE_DIR` to use another local location.
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the design constraints a change is expected to hold —
+no runtime dependencies, local-first state, and no silent widening of dispatch authority.
+
+Report a vulnerability privately per [SECURITY.md](SECURITY.md) rather than in a public issue.
 
 ## Uninstall
 

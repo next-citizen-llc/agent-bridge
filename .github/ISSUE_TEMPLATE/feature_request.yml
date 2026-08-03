@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a capability or change
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What you are trying to do that is currently awkward or impossible.
+        Describe the situation, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you think should happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >
+        Including whether an existing command already covers part of it.
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Design constraints
+      description: >
+        Agent Bridge keeps these deliberately. Confirm the proposal holds them, or
+        explain above why it should not.
+      options:
+        - label: Needs no new runtime dependency
+        - label: Adds no network egress to a service Agent Bridge operates
+        - label: Does not widen the authority a dispatch carries

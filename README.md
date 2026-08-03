@@ -161,6 +161,7 @@ vendor CLI may still be transmitted under that tool's own account, privacy, and 
 - [Authority should be explicit state, not prompt prose](docs/field-notes/authority-is-state.md)
 - [A failure taxonomy for cross-harness workflows](docs/field-notes/failure-taxonomy.md)
 - [Verifying an agent handoff without sharing private transcripts](docs/field-notes/verifiable-handoffs.md)
+- [A dispatched review is not a completed review](docs/field-notes/dispatched-review-provenance.md)
 
 ## Development
 

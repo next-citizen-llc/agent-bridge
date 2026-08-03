@@ -61,7 +61,9 @@ this state to another local directory.
 
 Cross-machine harness registration is a OneDrive-friendly heartbeat store. A fresh record means a
 harness recently wrote to the shared folder; it does not prove that a UI session is idle, connected,
-or ready for work.
+or ready for work. Registry filenames use a short hash of the platform's stable machine identifier
+instead of the network-dependent hostname; the raw identifier is not stored. Status inspection
+prunes heartbeat rows older than 30 days unless `--no-prune` is requested.
 
 ## Extension points
 

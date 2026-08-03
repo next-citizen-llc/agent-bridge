@@ -100,10 +100,70 @@ def configure_shared_roots(values: dict[str, str], *, path: Path | None = None) 
     return {"config_file": str(target), "roots": current}
 
 
+def _sanitize_id(value: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in value).strip("_")[:80] or "machine"
+
+
+def platform_uuid() -> str | None:
+    """A machine identifier that survives hostname changes, or None.
+
+    `socket.gethostname()` is not stable on macOS because it may follow the
+    active network. Keying the shared registry on it creates duplicate machine
+    identities and a registry that only grows.
+    """
+
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True, text=True, timeout=5, check=False,
+            ).stdout
+            match = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out)
+            return match.group(1) if match else None
+
+        if sys.platform.startswith("linux"):
+            for candidate in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+                if candidate.is_file():
+                    value = candidate.read_text(encoding="utf-8", errors="replace").strip()
+                    if value:
+                        return value
+            return None
+
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["reg", "query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"],
+                capture_output=True, text=True, timeout=5, check=False,
+            ).stdout
+            match = re.search(r"MachineGuid\s+REG_SZ\s+(\S+)", out)
+            return match.group(1) if match else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return None
+
+
+_MACHINE_ID_CACHE: dict[str, str] = {}
+
+
 def machine_id() -> str:
+    """Stable per-machine registry key: `<user>_<8 hex of platform uuid>`.
+
+    Falls back to the old user@hostname form only when no platform UUID is
+    available, and honours `AGENT_BRIDGE_MACHINE_ID` above both.
+    """
+
     explicit = os.environ.get("AGENT_BRIDGE_MACHINE_ID")
-    value = explicit or f"{getpass.getuser()}@{socket.gethostname()}"
-    return "".join(char if char.isalnum() or char in "-_" else "_" for char in value).strip("_")[:80] or "machine"
+    if explicit:
+        return _sanitize_id(explicit)
+
+    if "value" not in _MACHINE_ID_CACHE:
+        user = getpass.getuser()
+        uuid_value = platform_uuid()
+        if uuid_value:
+            digest = hashlib.sha256(uuid_value.encode("utf-8")).hexdigest()[:8]
+            _MACHINE_ID_CACHE["value"] = _sanitize_id(f"{user}_{digest}")
+        else:
+            _MACHINE_ID_CACHE["value"] = _sanitize_id(f"{user}@{socket.gethostname()}")
+    return _MACHINE_ID_CACHE["value"]
 
 
 def _dedupe(paths: list[Path]) -> list[Path]:

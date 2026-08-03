@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import time
 import unittest
 from unittest import mock
 
+from agent_bridge import readiness
 from agent_bridge.context_adapters import ContextAdapterError, context_status, install_context_adapters
 from agent_bridge.readiness import (
     _auth_check,
@@ -315,6 +317,50 @@ class ReadinessTests(unittest.TestCase):
         self.assertFalse(status["ok"])
         self.assertFalse(check["ok"])
         self.assertEqual({row["source"] for row in status["overlaps"]}, {"adapter:grok", "foreign"})
+
+
+class StableMachineIdTests(unittest.TestCase):
+    """The registry key must not follow a network-dependent hostname."""
+
+    def setUp(self) -> None:
+        readiness._MACHINE_ID_CACHE.clear()
+        self._saved = os.environ.pop("AGENT_BRIDGE_MACHINE_ID", None)
+
+    def tearDown(self) -> None:
+        readiness._MACHINE_ID_CACHE.clear()
+        if self._saved is not None:
+            os.environ["AGENT_BRIDGE_MACHINE_ID"] = self._saved
+
+    def test_id_is_stable_across_hostname_changes(self) -> None:
+        with mock.patch.object(readiness.socket, "gethostname", return_value="workstation.local"):
+            first = readiness.machine_id()
+        readiness._MACHINE_ID_CACHE.clear()
+        with mock.patch.object(readiness.socket, "gethostname", return_value="workstation.corp"):
+            second = readiness.machine_id()
+        self.assertEqual(first, second)
+
+    def test_explicit_override_wins(self) -> None:
+        os.environ["AGENT_BRIDGE_MACHINE_ID"] = "ci-runner-7"
+        self.assertEqual(readiness.machine_id(), "ci-runner-7")
+
+    def test_id_hashes_platform_uuid_without_exposing_it(self) -> None:
+        raw_uuid = "01234567-89AB-CDEF-0123-456789ABCDEF"
+        expected_hash = hashlib.sha256(raw_uuid.encode("utf-8")).hexdigest()[:8]
+        with mock.patch.object(readiness.getpass, "getuser", return_value="alice"):
+            with mock.patch.object(readiness, "platform_uuid", return_value=raw_uuid):
+                value = readiness.machine_id()
+        self.assertEqual(value, f"alice_{expected_hash}")
+        self.assertNotIn(raw_uuid, value)
+
+    def test_falls_back_to_hostname_without_platform_uuid(self) -> None:
+        with mock.patch.object(readiness, "platform_uuid", return_value=None):
+            with mock.patch.object(readiness.socket, "gethostname", return_value="host.example"):
+                self.assertIn("host", readiness.machine_id())
+
+    def test_cli_and_readiness_agree(self) -> None:
+        from agent_bridge.cli import _harness_machine_id
+
+        self.assertEqual(_harness_machine_id(), readiness.machine_id())
 
 
 if __name__ == "__main__":

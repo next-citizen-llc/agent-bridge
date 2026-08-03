@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -141,6 +142,47 @@ class MailboxTests(unittest.TestCase):
             )
         self.assertEqual(read.returncode, 0, read.stderr)
         self.assertIn("legacy", read.stdout)
+
+    def test_read_ignores_non_mailbox_jsonl_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mailbox_dir = Path(tmp) / "mailbox"
+            mailbox_dir.mkdir()
+            rows = [
+                {
+                    "schema_version": "1.0",
+                    "kind": "delivery",
+                    "id": "msg-envelope",
+                    "time": "2026-01-01T00:00:00Z",
+                    "source": "transport",
+                    "type": "review_request",
+                    "data": {"to": "claude"},
+                },
+                {
+                    "id": "m0001",
+                    "ts": "2026-01-01T00:01:00Z",
+                    "from": "codex",
+                    "to": "claude",
+                    "subject": "valid",
+                    "body": "hello",
+                },
+            ]
+            (mailbox_dir / "messages.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": tmp}
+            read = subprocess.run(
+                ["python3", str(MAILBOX), "read", "--to", "claude", "--full"],
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(read.returncode, 0, read.stderr)
+        self.assertIn("valid", read.stdout)
+        self.assertNotIn("review_request", read.stdout)
 
 
 if __name__ == "__main__":

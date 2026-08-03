@@ -26,6 +26,7 @@ except ImportError:
 
 STATE_DIR = os.path.expanduser(os.environ.get("AGENT_BRIDGE_STATE_DIR", "~/.local/state/agent-bridge"))
 MAILBOX = os.path.join(STATE_DIR, "mailbox", "messages.jsonl")
+MAILBOX_FIELDS = frozenset({"id", "ts", "from", "to", "subject", "body"})
 
 
 def _now() -> str:
@@ -42,6 +43,11 @@ def _load() -> list[dict]:
             if line:
                 out.append(json.loads(line))
     return out
+
+
+def _is_mailbox_message(row: object) -> bool:
+    """Return whether a JSONL row matches the mailbox message schema."""
+    return isinstance(row, dict) and MAILBOX_FIELDS.issubset(row)
 
 
 def _append(msg: dict) -> None:
@@ -104,9 +110,11 @@ def filter_messages(
     }
     if meta_filters:
         filters.update(meta_filters)
-    msgs = _load()
+    # A shared state file can contain legacy or foreign envelope records. Keep
+    # one incompatible row from making the entire mailbox unavailable.
+    msgs = [msg for msg in _load() if _is_mailbox_message(msg)]
     if to:
-        msgs = [m for m in msgs if m["to"] == to]
+        msgs = [m for m in msgs if m.get("to") == to]
     if unread_only:
         msgs = [m for m in msgs if m.get("status", "unread") != "read"]
     return [m for m in msgs if match_meta(m, filters)]
@@ -116,7 +124,7 @@ def mark_read(message_id: str, *, meta_filters: dict | None = None) -> dict | No
     msgs = _load()
     found = None
     for msg in msgs:
-        if msg["id"] == message_id and match_meta(msg, meta_filters or {}):
+        if _is_mailbox_message(msg) and msg.get("id") == message_id and match_meta(msg, meta_filters or {}):
             found = msg
             msg["status"] = "read"
     if found is not None:

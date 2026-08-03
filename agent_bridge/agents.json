@@ -6,7 +6,8 @@
       "adapter": "claude_code",
       "command": "claude",
       "env_command": "CLAUDE_BIN",
-      "description": "Anthropic Claude Code headless CLI"
+      "description": "Anthropic Claude Code headless CLI",
+      "cache_min_tokens": 512
     },
     {
       "id": "codex",

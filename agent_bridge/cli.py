@@ -859,7 +859,107 @@ def _usage_record(
     }
 
 
+BRIDGE_CACHE_CLASS = "review"
+
+
+def _bridge_cache_key(
+    *,
+    agent: dict[str, Any],
+    source: str,
+    mode: str,
+    prompt: str,
+    meta: dict[str, Any],
+) -> str:
+    """Key a review dispatch on its prompt, scope, and current repo state.
+
+    `cache_key` folds `repo_fingerprint` in, so HEAD plus a `git status --short`
+    fingerprint are part of the key. An edited worktree therefore misses instead
+    of replaying a review of code that no longer exists.
+    """
+
+    return cache_key(
+        cache_class=BRIDGE_CACHE_CLASS,
+        model=str(agent.get("model") or agent.get("id", "")),
+        provider=str(agent.get("id", "")),
+        prefix=build_scope(source, agent, mode, meta),
+        task=prompt,
+        project_dir=PROJECT_DIR,
+        tool="bridge-review",
+    )
+
+
 def _invoke_target_once(
+    agent: dict[str, Any],
+    *,
+    source: str,
+    mode: str,
+    prompt: str,
+    budget_usd: str,
+    dry_run: bool,
+    meta: dict[str, Any] | None = None,
+    media_dirs: list[Path] | None = None,
+    route_policy: str = "standard",
+    cache_mode: str = "off",
+) -> AgentRunResult:
+    """Dispatch, optionally serving an identical prior review from the local cache.
+
+    Only `review` is cacheable. A `code` dispatch mutates the worktree, so a hit
+    would report work that never ran; `cache_store` enforces the same boundary
+    through `SAFE_CACHE_CLASSES`, which has no `code` member.
+    """
+
+    meta = meta or {}
+    cacheable = cache_mode == "exact" and mode == "review" and not dry_run
+    key = ""
+
+    if cacheable:
+        key = _bridge_cache_key(agent=agent, source=source, mode=mode, prompt=prompt, meta=meta)
+        hit = cache_lookup(key)
+        if hit["status"] == "hit":
+            cached = hit["entry"].get("value") or {}
+            output = str(cached.get("output", ""))
+            print(output)
+            print(f"[cache] {agent['id']} review served from local cache {key}", file=sys.stderr)
+            emit_event(
+                "agent.completed",
+                run_id=meta.get("run_id"),
+                meta=meta,
+                data={
+                    "target": agent["id"],
+                    "mode": mode,
+                    "return_code": 0,
+                    "dry_run": False,
+                    "cache_status": "hit",
+                    "cache_key": key,
+                },
+            )
+            return AgentRunResult(return_code=0, output=output, usage=cached.get("usage"))
+
+    result = _invoke_target_dispatch(
+        agent,
+        source=source,
+        mode=mode,
+        prompt=prompt,
+        budget_usd=budget_usd,
+        dry_run=dry_run,
+        meta=meta,
+        media_dirs=media_dirs,
+        route_policy=route_policy,
+    )
+
+    if cacheable and result.return_code == 0:
+        cache_store(
+            key,
+            {"output": result.output, "usage": result.usage},
+            cache_class=BRIDGE_CACHE_CLASS,
+            semantic_text=prompt,
+            metadata={"target": agent["id"], "mode": mode, "run_id": str(meta.get("run_id", ""))},
+        )
+
+    return result
+
+
+def _invoke_target_dispatch(
     agent: dict[str, Any],
     *,
     source: str,
@@ -1042,6 +1142,7 @@ def invoke_target(
     budget_auto: bool = True,
     max_auto_budget_usd: str = DEFAULT_MAX_AUTO_BUDGET_USD,
     route_policy: str = "standard",
+    cache_mode: str = "off",
 ) -> int:
     budget = calibrated_budget(agent["id"], budget_usd, enabled=budget_auto and not dry_run)
     while True:
@@ -1055,6 +1156,7 @@ def invoke_target(
             meta=meta,
             media_dirs=media_dirs,
             route_policy=route_policy,
+            cache_mode=cache_mode,
         )
         if result.return_code == 0:
             if budget_auto and not dry_run:
@@ -1099,6 +1201,16 @@ def parse_bridge_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--from", dest="source", help="Calling agent or instance, e.g. codex, claude, human")
     parser.add_argument("--to", dest="targets", help="Target agent ids, numbers, comma list, or 'all'")
     parser.add_argument("--mode", choices=["review", "code"], help="Bridge mode")
+    parser.add_argument(
+        "--cache-mode",
+        choices=["off", "exact"],
+        default=os.environ.get("AGENT_BRIDGE_BRIDGE_CACHE_MODE", "off"),
+        help=(
+            "Serve an identical prior review from the local deterministic cache. "
+            "Keyed on prompt, scope, and repo state, so an edited worktree misses. "
+            "Review mode only; code dispatches are never cached."
+        ),
+    )
     parser.add_argument("--prompt", help="Task prompt. If omitted in non-interactive mode, stdin is used.")
     parser.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_BUDGET_USD", DEFAULT_BUDGET_USD))
     parser.add_argument("--no-budget-auto", action="store_true", help="Disable automatic budget retry/calibration")
@@ -1180,6 +1292,11 @@ def bridge(argv: list[str]) -> int:
             card = capability_card(agents[target_id], bridge_dir=BRIDGE_DIR)
             for problem in explain_incompatibility(card, mode=mode, media_suffixes=media_suffixes, project_dir=str(PROJECT_DIR)):
                 print(f"[dry-run] incompatibility: {problem}")
+    if args.cache_mode == "exact" and mode != "review":
+        raise BridgeError(
+            "--cache-mode exact applies to --mode review only; a code dispatch mutates the "
+            "worktree, so a cache hit would report work that never ran"
+        )
     rc = 0
     for target_id in targets:
         target_meta = child_turn_meta(
@@ -1200,6 +1317,7 @@ def bridge(argv: list[str]) -> int:
             budget_auto=not args.no_budget_auto,
             max_auto_budget_usd=str(args.max_auto_budget_usd),
             route_policy=args.route_policy,
+            cache_mode=args.cache_mode,
         )
         if target_rc != 0:
             rc = target_rc

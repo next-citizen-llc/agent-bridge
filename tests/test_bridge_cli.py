@@ -724,6 +724,7 @@ class BridgeCliTests(unittest.TestCase):
             ).strip())
             self.assertIn("deployed_revision", registration)
             self.assertIn("update_status", registration)
+            self.assertNotIn("platform_uuid", registration)
 
     def test_harness_register_and_status_use_shared_agent_skills_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -758,6 +759,37 @@ class BridgeCliTests(unittest.TestCase):
             self.assertEqual(len(payload["harnesses"]), 1)
             self.assertEqual(payload["harnesses"][0]["client"], "codex")
             self.assertTrue(payload["harnesses"][0]["fresh"])
+
+    def test_harness_status_prunes_only_expired_registry_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            shared_root = Path(tmp) / "SharedAgentSkills"
+            registry = shared_root / "Agent-Bridge" / "registry"
+            registry.mkdir(parents=True)
+            old = registry / "old.codex.gui.json"
+            fresh = registry / "fresh.codex.gui.json"
+            old.write_text(json.dumps({"updated_at": "2000-01-01T00:00:00Z", "status": "active"}), encoding="utf-8")
+            fresh.write_text(json.dumps({"updated_at": bridge_cli.iso_now(), "status": "active"}), encoding="utf-8")
+
+            payload = bridge_cli.load_harness_registry(str(shared_root))
+
+            self.assertEqual(payload["pruned"], [old.name])
+            self.assertFalse(old.exists())
+            self.assertTrue(fresh.exists())
+            self.assertEqual([Path(row["registry_file"]).name for row in payload["harnesses"]], [fresh.name])
+
+    def test_harness_status_no_prune_retains_expired_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            shared_root = Path(tmp) / "SharedAgentSkills"
+            registry = shared_root / "Agent-Bridge" / "registry"
+            registry.mkdir(parents=True)
+            old = registry / "old.codex.gui.json"
+            old.write_text(json.dumps({"updated_at": "2000-01-01T00:00:00Z", "status": "active"}), encoding="utf-8")
+
+            payload = bridge_cli.load_harness_registry(str(shared_root), prune=False)
+
+            self.assertEqual(payload["pruned"], [])
+            self.assertTrue(old.exists())
+            self.assertEqual(len(payload["harnesses"]), 1)
 
     def test_session_start_reexecutes_once_after_bridge_update(self) -> None:
         update = {
@@ -802,6 +834,8 @@ class BridgeCliTests(unittest.TestCase):
             self.assertIn("agent code preflight configure", skill_text)
             self.assertIn("agent code context check", skill_text)
             self.assertIn("agent code update <status|check|apply>", skill_text)
+            self.assertIn("raw platform identifier is never written", skill_text)
+            self.assertIn("agent code harness status --no-prune", skill_text)
             self.assertEqual(codex_link.resolve(), (shared_root / "Agent-Bridge").resolve())
             self.assertEqual(claude_link.resolve(), (shared_root / "Agent-Bridge").resolve())
             self.assertEqual(agents_link.resolve(), (shared_root / "Agent-Bridge").resolve())

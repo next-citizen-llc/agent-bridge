@@ -80,6 +80,7 @@ from .readiness import (
     configure_shared_roots,
     flush_readiness_queue,
     load_cached_preflight,
+    machine_id as stable_machine_id,
     publish_readiness,
     resolve_shared_roots,
     run_preflight,
@@ -1639,10 +1640,13 @@ def _git_revision(repo: Path, ref: str) -> str:
 
 
 def _harness_machine_id() -> str:
-    explicit = os.environ.get("AGENT_BRIDGE_MACHINE_ID")
-    if explicit:
-        return safe_fragment(explicit)
-    return safe_fragment(f"{getpass.getuser()}@{socket.gethostname()}")
+    """Registry key for this machine. See `readiness.machine_id`.
+
+    Was a second, slightly different copy of that function keyed on
+    `socket.gethostname()`, which changes with the active network.
+    """
+
+    return stable_machine_id()
 
 
 def register_harness(
@@ -1751,20 +1755,50 @@ def _bounded_read_text(path: Path, *, timeout: float = 0.5) -> str:
     return str(_bounded_io(lambda: path.read_text(encoding="utf-8"), timeout=timeout))
 
 
-def load_harness_registry(root: str | None = None, *, stale_minutes: int = 1440) -> dict[str, Any]:
+# A row this old describes a harness that has not started in a month. Keeping it
+# makes `harness status` read mostly-dead entries; the registry is a heartbeat
+# store, so an unrefreshed row carries no information.
+REGISTRY_EXPIRY_DAYS = 30
+
+
+def load_harness_registry(
+    root: str | None = None,
+    *,
+    stale_minutes: int = 1440,
+    prune: bool = True,
+) -> dict[str, Any]:
     bridge_dir = shared_bridge_dir(root, create=False)
     assert bridge_dir is not None
     registry_dir = bridge_dir / SHARED_REGISTRY_DIR_NAME
     now = dt.datetime.now(dt.timezone.utc)
+    expiry_seconds = REGISTRY_EXPIRY_DAYS * 86400
     rows: list[dict[str, Any]] = []
+    pruned: list[str] = []
     if registry_dir.exists():
         for path in sorted(registry_dir.glob("*.json")):
+            original_stat = None
             try:
+                original_stat = path.stat()
                 row = json.loads(_bounded_read_text(path))
             except (OSError, TimeoutError, json.JSONDecodeError) as exc:
                 row = {"client": "unknown", "machine_id": path.stem, "status": "invalid", "error": str(exc)}
             updated = _parse_iso_timestamp(row.get("updated_at"))
             age_seconds = int((now - updated).total_seconds()) if updated else None
+            if prune and age_seconds is not None and age_seconds > expiry_seconds:
+                try:
+                    current_stat = path.stat()
+                    original_identity = (
+                        original_stat.st_ino,
+                        original_stat.st_size,
+                        original_stat.st_mtime_ns,
+                    ) if original_stat is not None else None
+                    current_identity = (current_stat.st_ino, current_stat.st_size, current_stat.st_mtime_ns)
+                    if original_identity == current_identity:
+                        path.unlink()
+                        pruned.append(path.name)
+                        continue
+                except OSError:
+                    pass
             row["registry_file"] = str(path)
             row["age_seconds"] = age_seconds
             row["fresh"] = bool(age_seconds is not None and age_seconds <= stale_minutes * 60 and row.get("status") == "active")
@@ -1773,6 +1807,8 @@ def load_harness_registry(root: str | None = None, *, stale_minutes: int = 1440)
         "shared_bridge_dir": str(bridge_dir),
         "registry_dir": str(registry_dir),
         "stale_minutes": stale_minutes,
+        "expiry_days": REGISTRY_EXPIRY_DAYS,
+        "pruned": pruned,
         "harnesses": rows,
     }
 
@@ -1782,8 +1818,12 @@ def format_harness_registry(data: dict[str, Any]) -> str:
         f"Shared Agent Bridge: {data['shared_bridge_dir']}",
         f"Registry: {data['registry_dir']}",
         f"Stale after: {data['stale_minutes']} minutes",
+        f"Retention: {data.get('expiry_days', REGISTRY_EXPIRY_DAYS)} days",
         "",
     ]
+    pruned = data.get("pruned", [])
+    if pruned:
+        lines.extend([f"Pruned expired rows: {len(pruned)}", ""])
     rows = data.get("harnesses", [])
     if not rows:
         lines.append("(no harness registrations found)")
@@ -2082,6 +2122,20 @@ Use the installed `agent` command as the front door for local and cross-harness 
 The shared OneDrive package lives in a folder named `{SHARED_BRIDGE_DIR_NAME}` under the resolved `SharedAgentSkills` root. Each hooked harness writes one JSON heartbeat under `{SHARED_BRIDGE_DIR_NAME}/{SHARED_REGISTRY_DIR_NAME}/`.
 
 Treat a fresh registry row as "this harness has recently started or resumed and can see the shared folder", not as proof that an existing UI chat is idle or ready to accept work. Use `agent code harness status --json` when another tool needs machine-readable status.
+
+### Row identity
+
+Each row is keyed by `<machine>.<client>[.<surface>]`. Unless
+`AGENT_BRIDGE_MACHINE_ID` is set, the machine key combines the local username
+with the first eight hexadecimal characters of a SHA-256 hash of the platform's
+stable machine identifier (macOS `IOPlatformUUID`, Linux `machine-id`, or
+Windows `MachineGuid`). The raw platform identifier is never written to the
+shared registry. If no stable identifier is available, Agent Bridge falls back
+to the legacy username-and-hostname key.
+
+Registry rows older than `{REGISTRY_EXPIRY_DAYS}` days are pruned during status
+inspection. Use `agent code harness status --no-prune` for a read-only view that
+retains expired rows.
 
 ## Path Rules
 
@@ -2828,6 +2882,7 @@ def harness_cmd(argv: list[str]) -> int:
     status = sub.add_parser("status", help="Show shared Agent Bridge harness registry rows.")
     status.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
     status.add_argument("--stale-minutes", type=int, default=1440)
+    status.add_argument("--no-prune", action="store_true", help="Retain registry rows older than the retention window.")
     status.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
@@ -2849,7 +2904,7 @@ def harness_cmd(argv: list[str]) -> int:
         )
         _json_print(record) if args.json else print(f"{record['client']}: registered ({record['registry_file']})")
         return 0
-    data = load_harness_registry(args.root, stale_minutes=args.stale_minutes)
+    data = load_harness_registry(args.root, stale_minutes=args.stale_minutes, prune=not args.no_prune)
     _json_print(data) if args.json else print(format_harness_registry(data), end="")
     return 0
 

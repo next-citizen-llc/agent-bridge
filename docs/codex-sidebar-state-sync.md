@@ -55,7 +55,7 @@ macOS/Linux:
 SYNC_ROOT="$HOME/Library/CloudStorage/OneDrive-nextcz.com/SharedAgentData/CodexSidebarSync"
 BUNDLE="$SYNC_ROOT/$(hostname)-$(date -u +%Y%m%dT%H%M%SZ)"
 
-cd /Users/tts/Code/agent-bridge
+cd "$HOME/Code/agent-bridge"
 scripts/codex-sidebar-sync.sh export --out "$BUNDLE"
 ```
 
@@ -81,7 +81,7 @@ macOS target:
 ```bash
 BUNDLE="/path/to/CodexSidebarSync/<source-host>-<timestamp>"
 
-cd /Users/tts/Code/agent-bridge
+cd "$HOME/Code/agent-bridge"
 scripts/codex-sidebar-sync.sh import \
   --from "$BUNDLE" \
   --yes \
@@ -136,7 +136,7 @@ Every import writes a target backup before replacing files:
 To roll back, import that backup bundle:
 
 ```bash
-cd /Users/tts/Code/agent-bridge
+cd "$HOME/Code/agent-bridge"
 scripts/codex-sidebar-sync.sh import \
   --from "$HOME/.codex/backups/sidebar-state-sync-<timestamp>" \
   --yes \

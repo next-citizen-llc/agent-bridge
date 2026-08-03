@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,32 @@ version = "0.1.0"
 description = "Global local bridge for bounded headless collaboration between coding agents."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Tristan Springmeyer" }]
+keywords = ["agents", "cli", "mcp", "local-first", "developer-tools", "code-review"]
 dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/next-citizen-llc/agent-bridge"
+Repository = "https://github.com/next-citizen-llc/agent-bridge"
+Issues = "https://github.com/next-citizen-llc/agent-bridge/issues"
+Changelog = "https://github.com/next-citizen-llc/agent-bridge/releases"
 
 [project.scripts]
 agent = "agent_bridge.cli:main_entry"

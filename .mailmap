@@ -1,0 +1,5 @@
+# Canonicalize author and committer identities in git log, shortlog, and blame.
+# History is not rewritten; this only normalizes how the same person is displayed.
+Tristan Springmeyer <tristan@nextcz.com> <102992807+tristan-nextcz@users.noreply.github.com>
+Tristan Springmeyer <tristan@nextcz.com> T <102992807+tristan-nextcz@users.noreply.github.com>
+Tristan Springmeyer <tristan@nextcz.com> tristan-nextcz <102992807+tristan-nextcz@users.noreply.github.com>

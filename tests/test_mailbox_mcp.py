@@ -126,6 +126,52 @@ class MailboxMcpTests(unittest.TestCase):
         self.assertIn("no message m0001", rows[2]["result"]["content"][0]["text"])
         self.assertIn('"role": "builder"', rows[3]["result"]["content"][0]["text"])
 
+    def test_mailbox_inbox_ignores_non_mailbox_jsonl_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mailbox_dir = Path(tmp) / "mailbox"
+            mailbox_dir.mkdir()
+            (mailbox_dir / "messages.jsonl").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "kind": "delivery",
+                        "id": "msg-envelope",
+                        "time": "2026-01-01T00:00:00Z",
+                        "source": "transport",
+                        "type": "review_request",
+                        "data": {"to": "codex"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": tmp}
+            payload = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "mailbox_inbox",
+                        "arguments": {"to": "codex", "unread_only": True},
+                    },
+                }
+            )
+            proc = subprocess.run(
+                ["python3", str(MCP)],
+                input=payload + "\n",
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        row = json.loads(proc.stdout)
+        self.assertFalse(row["result"]["isError"])
+        self.assertEqual(row["result"]["content"][0]["text"], "(empty)")
+
 
 if __name__ == "__main__":
     unittest.main()

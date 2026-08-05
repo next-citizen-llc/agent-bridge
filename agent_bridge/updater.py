@@ -35,13 +35,24 @@ def state_dir() -> Path:
     return Path(os.environ.get("AGENT_BRIDGE_STATE_DIR", Path.home() / ".local/state/agent-bridge")).expanduser()
 
 
-def update_state_path() -> Path:
-    return state_dir() / "update" / "status.json"
+BRIDGE_SLUG = "bridge"
 
 
-def load_update_state() -> dict[str, Any]:
+def safe_slug(value: str) -> str:
+    """Reduce a repo id to a filesystem-safe state key."""
+    cleaned = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in value.strip().lower())
+    return cleaned.strip("-") or "repo"
+
+
+def update_state_path(slug: str = BRIDGE_SLUG) -> Path:
+    # The bridge keeps its historical filename so existing state survives upgrades.
+    name = "status.json" if slug == BRIDGE_SLUG else f"status-{safe_slug(slug)}.json"
+    return state_dir() / "update" / name
+
+
+def load_update_state(slug: str = BRIDGE_SLUG) -> dict[str, Any]:
     try:
-        data = json.loads(update_state_path().read_text(encoding="utf-8"))
+        data = json.loads(update_state_path(slug).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -108,12 +119,14 @@ def _remote_matches(actual: str, expected: str) -> bool:
     return bool(actual) and normalize(actual) == normalize(expected)
 
 
-def _lock_dir() -> Path:
-    return state_dir() / "update" / "update.lock"
+def _lock_dir(slug: str = BRIDGE_SLUG) -> Path:
+    # Per-repo locks so a managed repo can never serialize behind or clobber the bridge's own lock.
+    name = "update.lock" if slug == BRIDGE_SLUG else f"update-{safe_slug(slug)}.lock"
+    return state_dir() / "update" / name
 
 
-def _acquire_lock(*, stale_seconds: int = 300) -> bool:
-    path = _lock_dir()
+def _acquire_lock(slug: str = BRIDGE_SLUG, *, stale_seconds: int = 300) -> bool:
+    path = _lock_dir(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         path.mkdir()
@@ -137,37 +150,38 @@ def _acquire_lock(*, stale_seconds: int = 300) -> bool:
             return False
 
 
-def _release_lock() -> None:
-    shutil.rmtree(_lock_dir(), ignore_errors=True)
+def _release_lock(slug: str = BRIDGE_SLUG) -> None:
+    shutil.rmtree(_lock_dir(slug), ignore_errors=True)
 
 
-def _base_result(repo: Path, action: str) -> dict[str, Any]:
+def _base_result(repo: Path, action: str, slug: str = BRIDGE_SLUG) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "agent-bridge.update",
         "action": action,
         "checked_at": iso_now(),
         "repo": str(repo),
+        "slug": slug,
         "status": "unknown",
         "changed": False,
         "installed": False,
         "local_revision": "",
         "remote_revision": "",
-        "deployed_revision": str(load_update_state().get("deployed_revision", "")),
+        "deployed_revision": str(load_update_state(slug).get("deployed_revision", "")),
         "error_class": "",
         "detail": "",
     }
 
 
-def _write_result(result: dict[str, Any]) -> dict[str, Any]:
-    _atomic_json(update_state_path(), result)
+def _write_result(result: dict[str, Any], slug: str = BRIDGE_SLUG) -> dict[str, Any]:
+    _atomic_json(update_state_path(slug), result)
     return result
 
 
-def _cached_result(repo: Path, *, interval_seconds: int, force: bool) -> dict[str, Any] | None:
+def _cached_result(repo: Path, *, interval_seconds: int, force: bool, slug: str = BRIDGE_SLUG) -> dict[str, Any] | None:
     if force or interval_seconds <= 0:
         return None
-    previous = load_update_state()
+    previous = load_update_state(slug)
     checked = parse_iso(previous.get("checked_at"))
     if checked is None:
         return None
@@ -228,18 +242,21 @@ def update_bridge(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     expected_remote: str = DEFAULT_EXPECTED_REMOTE,
     refresh: Callable[[Path, int], tuple[bool, str]] | None = None,
+    slug: str = BRIDGE_SLUG,
+    branch_name: str = "main",
 ) -> dict[str, Any]:
     """Check or fast-forward the canonical checkout and refresh local integrations."""
     repo = repo.expanduser().resolve()
     if action not in {"status", "check", "apply"}:
         raise ValueError("action must be status, check, or apply")
-    result = _base_result(repo, action)
+    result = _base_result(repo, action, slug)
     if os.environ.get("AGENT_BRIDGE_DISABLE_AUTO_UPDATE") in {"1", "true", "TRUE", "yes"} and action == "apply":
         result.update({"status": "disabled", "detail": "automatic update disabled by environment"})
         return result
+    # A linked worktree's .git is a file rather than a directory, so exists() is the correct probe.
     if not (repo / ".git").exists():
         result.update({"status": "blocked", "error_class": "config_missing", "detail": "canonical checkout is not a git repository"})
-        return _write_result(result)
+        return _write_result(result, slug)
     local = bridge_revision(repo)
     result["local_revision"] = local
     result["remote_revision"] = _git_value(repo, ["rev-parse", "refs/remotes/origin/main"], timeout=3)
@@ -248,26 +265,26 @@ def update_bridge(
         deployed = bool(local and local == result.get("deployed_revision"))
         result.update({"status": "current" if current and deployed else "stale", "detail": "local status only; no network request"})
         return result
-    if not _acquire_lock():
+    if not _acquire_lock(slug):
         result.update({"status": "busy", "error_class": "unknown", "detail": "another update is already running"})
         return result
     try:
         branch = _git_value(repo, ["branch", "--show-current"], timeout=3)
         result["branch"] = branch
-        if branch != "main":
-            result.update({"status": "blocked_branch", "error_class": "config_missing", "detail": "automatic updates require the canonical main branch"})
-            return _write_result(result)
+        if branch != branch_name:
+            result.update({"status": "blocked_branch", "error_class": "config_missing", "detail": f"automatic updates require the canonical {branch_name} branch"})
+            return _write_result(result, slug)
         rc, dirty = _git(repo, ["status", "--porcelain"], timeout=3)
         if rc != 0 or dirty:
             result.update({"status": "blocked_dirty", "error_class": "permission_denied", "detail": "checkout has local changes; update was not attempted"})
-            return _write_result(result)
+            return _write_result(result, slug)
         remote = _git_value(repo, ["remote", "get-url", "origin"], timeout=3)
         result["remote"] = remote
         if not _remote_matches(remote, expected_remote):
             result.update({"status": "blocked_remote", "error_class": "permission_denied", "detail": "origin does not match the configured canonical repository"})
-            return _write_result(result)
+            return _write_result(result, slug)
         if action == "apply":
-            cached = _cached_result(repo, interval_seconds=interval_seconds, force=force)
+            cached = _cached_result(repo, interval_seconds=interval_seconds, force=force, slug=slug)
             if cached is not None:
                 return cached
         fetch_env = dict(os.environ)
@@ -275,46 +292,46 @@ def update_bridge(
         rc, _ = _git(repo, ["fetch", "--prune", "origin", "main"], timeout=timeout, env=fetch_env)
         if rc != 0:
             result.update({"status": "offline", "error_class": "network_unreachable", "detail": f"git fetch failed or timed out (exit {rc}); continuing with the installed revision"})
-            return _write_result(result)
+            return _write_result(result, slug)
         remote_revision = _git_value(repo, ["rev-parse", "refs/remotes/origin/main"], timeout=3)
         result["remote_revision"] = remote_revision
         if not remote_revision:
             result.update({"status": "blocked", "error_class": "source_unreachable", "detail": "origin/main could not be resolved after fetch"})
-            return _write_result(result)
+            return _write_result(result, slug)
         if local != remote_revision:
             rc_ancestor, _ = _git(repo, ["merge-base", "--is-ancestor", local, remote_revision], timeout=3)
             rc_remote_ancestor, _ = _git(repo, ["merge-base", "--is-ancestor", remote_revision, local], timeout=3)
             if rc_ancestor != 0:
                 status = "blocked_ahead" if rc_remote_ancestor == 0 else "blocked_diverged"
                 result.update({"status": status, "error_class": "permission_denied", "detail": "local history is not a fast-forward of origin/main"})
-                return _write_result(result)
+                return _write_result(result, slug)
             if action == "check":
                 result.update({"status": "update_available", "detail": "origin/main is ahead; no files were changed"})
-                return _write_result(result)
+                return _write_result(result, slug)
             rc, _ = _git(repo, ["merge", "--ff-only", "refs/remotes/origin/main"], timeout=timeout)
             if rc != 0:
                 result.update({"status": "blocked", "error_class": "permission_denied", "detail": f"fast-forward merge failed (exit {rc})"})
-                return _write_result(result)
+                return _write_result(result, slug)
             result["changed"] = True
             local = bridge_revision(repo)
             result["local_revision"] = local
         elif action == "check":
             result.update({"status": "current", "detail": "checkout matches origin/main"})
-            return _write_result(result)
+            return _write_result(result, slug)
         needs_install = result["changed"] or result.get("deployed_revision") != local
         if needs_install:
             install = refresh or (lambda path, seconds: _refresh_installation(path, timeout=seconds))
             ok, detail = install(repo, timeout)
             if not ok:
                 result.update({"status": "build_failed", "error_class": "config_missing", "detail": detail, "reexec_required": bool(result["changed"])})
-                return _write_result(result)
+                return _write_result(result, slug)
             result.update({"installed": True, "deployed_revision": local, "detail": detail})
         else:
             result["detail"] = "checkout and installed integrations already match origin/main"
         result.update({"status": "updated" if result["changed"] else "current", "reexec_required": bool(result["changed"])})
-        return _write_result(result)
+        return _write_result(result, slug)
     finally:
-        _release_lock()
+        _release_lock(slug)
 
 
 def format_update(result: dict[str, Any]) -> str:

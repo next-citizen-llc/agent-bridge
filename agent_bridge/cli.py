@@ -96,6 +96,14 @@ from .session_recovery import (
     load_recovery_selection,
     recover_sessions,
 )
+from .managed_repos import (
+    DEFAULT_MANAGED_INTERVAL_SECONDS,
+    DEFAULT_MANAGED_TIMEOUT_SECONDS,
+    describe_managed_repo,
+    format_managed_repos,
+    load_registry as load_managed_registry,
+    sync_managed_repos,
+)
 from .trace import emit_event, events_path, format_events, load_events
 from .updater import (
     DEFAULT_EXPECTED_REMOTE,
@@ -2071,6 +2079,8 @@ Use the installed `agent` command as the front door for local and cross-harness 
 - Register the current harness manually: `agent code harness register --client <codex|claude|other>`
 - Check local SessionStart hooks and wrappers: `agent code hooks status --client all`
 - Inspect or force the canonical bridge refresh: `agent code update <status|check|apply>`
+- Check tracked repos for drift and uncommitted work: `agent code repos status`
+- List the configured managed repos and their modes: `agent code repos list`
 - List callable local engines: `agent code bridge --list`
 - Inspect trace events: `agent code trace`
 
@@ -2081,6 +2091,17 @@ Use the installed `agent` command as the front door for local and cross-harness 
 - A changed revision is compiled and then refreshes the launcher, hooks, wrappers, and Codex, Claude, Grok, and shared `.agents` skill links. The startup hook re-executes once so the new code supplies the current session context.
 - Dirty, non-main, ahead, or diverged checkouts are never overwritten. Offline starts continue with the last installed revision and cache the failure briefly.
 - Set `AGENT_BRIDGE_DISABLE_AUTO_UPDATE=1` for an emergency startup bypass. Use `agent code update apply --force` to bypass only the normal freshness interval.
+
+## Managed Repos
+
+- The SessionStart hook can also check repos you track alongside the bridge, so shared sources stay consistent across harnesses, machines, and agents. Inspect with `agent code repos status`; list what is configured with `agent code repos list`.
+- The registry ships **empty**. Agent Bridge embeds no repo names, clone URLs, or filesystem paths; declare them per machine in `{STATE_DIR / 'managed-repos.json'}`. With no config file the sweep is inert and silent.
+- Repos declared `apply` are fast-forwarded through the same hardened path as the bridge: clean declared branch only, verified `origin`, ff-only. Repos declared `report` are read-only and never mutated. Use `report` for any repo that carries generated output, since a routinely dirty tree would pin `apply` in `blocked_dirty` forever.
+- Two failure modes are reported separately. Being behind `origin` is a sync problem a pull fixes. Work held as uncommitted local edits exists on no remote, so no pull on any other machine would ever retrieve it; those files are listed individually under `canonical_paths`.
+- A dirty checkout blocks its own update and still reports how far behind it is. Warning states, and states where drift was never determined (`busy`, `offline`, `disabled`), are never served from cache and never counted as current.
+- Missing checkouts report `absent` rather than failing: not every machine holds every repo.
+- Override a single path with `AGENT_BRIDGE_MANAGED_<ID>_PATH`. Set `AGENT_BRIDGE_DISABLE_MANAGED_REPOS=1` to skip the sweep entirely.
+- Managed repos default to a one-hour freshness interval, not the bridge's five minutes, because they do not gate startup correctness and a fetch per repo per session is wasted latency.
 
 ## Coordination
 
@@ -2360,6 +2381,55 @@ def update_cmd(argv: list[str]) -> int:
     return 0 if result.get("status") in success else 1
 
 
+def repos_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agent code repos",
+        description="Inspect canonical repos beyond Agent Bridge for drift and uncommitted canonical work.",
+    )
+    sub = parser.add_subparsers(dest="action", required=True)
+    for action in ("status", "list"):
+        command = sub.add_parser(action)
+        command.add_argument("--json", action="store_true")
+        if action == "status":
+            command.add_argument("--only", action="append", help="Limit to a repo id; repeatable.")
+            command.add_argument("--force", action="store_true", help="Ignore the recent-check cache.")
+            command.add_argument("--timeout", type=int, default=DEFAULT_MANAGED_TIMEOUT_SECONDS)
+            command.add_argument("--interval-seconds", type=int, default=DEFAULT_MANAGED_INTERVAL_SECONDS)
+    args = parser.parse_args(argv)
+
+    if args.action == "list":
+        registry = load_managed_registry()
+        if args.json:
+            _json_print({"repos": registry})
+            return 0
+        for entry in registry:
+            print(f"{entry['id']:<24} {entry['mode']:<7} {entry['branch']:<6} {entry['path']}")
+        return 0
+
+    results = sync_managed_repos(
+        timeout=max(1, args.timeout),
+        interval_seconds=max(0, args.interval_seconds),
+        force=args.force,
+        only=args.only,
+    )
+    if args.json:
+        _json_print({"repos": results})
+    else:
+        for result in results:
+            status = str(result.get("status", "unknown"))
+            print(f"{result['id']:<24} {status:<22} behind={result.get('behind', 0)} ahead={result.get('ahead', 0)} dirty={result.get('dirty_files', 0)}")
+            note = describe_managed_repo(result)
+            if note:
+                print(f"    {note}")
+            for line in result.get("uncommitted_canonical") or []:
+                print(f"    uncommitted canonical: {line}")
+        print(format_managed_repos(results).strip())
+    # Report-only repos legitimately sit behind or dirty, so a warning is not a
+    # command failure. Only a genuinely broken configuration is.
+    broken = {"not_git", "blocked_remote", "blocked_branch", "error"}
+    return 1 if any(str(r.get("status")) in broken for r in results) else 0
+
+
 def session_start_context(
     client: str,
     *,
@@ -2367,6 +2437,7 @@ def session_start_context(
     registration: dict[str, Any] | None = None,
     readiness: dict[str, Any] | None = None,
     update: dict[str, Any] | None = None,
+    managed: list[dict[str, Any]] | None = None,
 ) -> str:
     cwd = os.environ.get("PWD") or str(Path.cwd())
     git_root = _git_root_for_path(cwd)
@@ -2397,9 +2468,9 @@ def session_start_context(
         "for a full builder/critic/verifier spawn. Mailbox MCP, when registered, should point to "
         f"`{BRIDGE_DIR / 'mailbox_mcp.py'}`. Use `agent code harness status` to inspect shared "
         "OneDrive harness registrations. This startup hook never spawns agents or mutates the active project; "
-        "its bounded updater only fast-forwards a clean canonical Agent Bridge checkout. "
+        "its bounded updater only fast-forwards clean canonical checkouts and never modifies report-only repos. "
         f"Client: {client}. Surface: {surface}."
-        f"{location}{update_text}{registry}{readiness_text}"
+        f"{location}{update_text}{registry}{readiness_text}{format_managed_repos(managed or [])}"
     )
 
 
@@ -2410,6 +2481,21 @@ def hook_session_start(argv: list[str]) -> int:
     parser.add_argument("--startup-mechanism", default="native-session-hook")
     parser.add_argument("--plain", action="store_true", help="Print plain context instead of hook JSON")
     parser.add_argument("--skip-update", action="store_true", help="Skip the automatic refresh for this invocation.")
+    parser.add_argument(
+        "--skip-managed-repos",
+        action="store_true",
+        help="Skip the canonical managed-repo drift check for this invocation.",
+    )
+    parser.add_argument(
+        "--managed-repo-timeout",
+        type=int,
+        default=int(os.environ.get("AGENT_BRIDGE_MANAGED_TIMEOUT", DEFAULT_MANAGED_TIMEOUT_SECONDS)),
+    )
+    parser.add_argument(
+        "--managed-repo-interval-seconds",
+        type=int,
+        default=int(os.environ.get("AGENT_BRIDGE_MANAGED_INTERVAL_SECONDS", DEFAULT_MANAGED_INTERVAL_SECONDS)),
+    )
     parser.add_argument(
         "--update-timeout",
         type=int,
@@ -2475,12 +2561,24 @@ def hook_session_start(argv: list[str]) -> int:
         )
     except (OSError, ValueError):
         readiness = None
+    # Managed-repo drift never gates startup: it reports, and at most
+    # fast-forwards a clean checkout. Any failure degrades to an empty list.
+    managed: list[dict[str, Any]] = []
+    if not args.skip_managed_repos:
+        try:
+            managed = sync_managed_repos(
+                timeout=max(1, args.managed_repo_timeout),
+                interval_seconds=max(0, args.managed_repo_interval_seconds),
+            )
+        except Exception:
+            managed = []
     context = session_start_context(
         args.client,
         surface=surface,
         registration=registration,
         readiness=readiness,
         update=update,
+        managed=managed,
     )
     if args.plain:
         print(context)
@@ -3900,6 +3998,8 @@ def main(argv: list[str]) -> int:
         return optimize_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "update":
         return update_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "repos":
+        return repos_cmd(argv[2:])
     if len(argv) >= 3 and argv[0] == "code" and argv[1] == "hook" and argv[2] == "session-start":
         return hook_session_start(argv[3:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "hooks":

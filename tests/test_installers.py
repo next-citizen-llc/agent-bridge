@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -205,10 +206,20 @@ class InstallerTests(unittest.TestCase):
             )
             old_python.chmod(0o755)
 
+            # Keep the negative fixture hermetic. GitHub's Ubuntu images expose
+            # supported versioned interpreters under /usr/bin, which the
+            # launcher correctly scans after the fake old python. Only the
+            # shell utilities needed before interpreter selection belong on
+            # this fixture's PATH.
+            for utility in ("bash", "dirname"):
+                target = shutil.which(utility)
+                self.assertIsNotNone(target)
+                (fake_bin / utility).symlink_to(target)
+
             result = subprocess.run(
                 [str(AGENT), "code", "bridge", "--list"],
                 cwd=str(ROOT),
-                env={"PATH": f"{fake_bin}:/usr/bin:/bin"},
+                env={"PATH": str(fake_bin)},
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

@@ -13,19 +13,11 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = (Resolve-Path $ProjectDir).Path
 $StateDir = Join-Path $HOME ".local\state\agent-bridge"
 $AgentCmd = Join-Path $BinDir "agent.cmd"
+$LauncherTemplate = Join-Path $PSScriptRoot "agent.cmd.template"
 
 New-Item -ItemType Directory -Force -Path $BinDir, $StateDir | Out-Null
 
-$cmd = @"
-@echo off
-set "PYTHONPATH=$ProjectDir;%PYTHONPATH%"
-where py >NUL 2>NUL
-if %ERRORLEVEL%==0 (
-  py -3 -m agent_bridge.cli %*
-) else (
-  python -m agent_bridge.cli %*
-)
-"@
+$cmd = (Get-Content -Raw -Path $LauncherTemplate).Replace("__AGENT_BRIDGE_PROJECT_DIR__", $ProjectDir)
 
 $launcherStatus = "installed"
 if (Test-Path $AgentCmd) {
@@ -68,14 +60,27 @@ if ($InstallHooks) {
 if ($RegisterMcp) {
     $MailboxMcp = Join-Path $ProjectDir "agent_bridge\mailbox_mcp.py"
     $PythonMcpCommand = @()
-    if (Get-Command py -ErrorAction SilentlyContinue) {
-        $PythonMcpCommand = @("py", "-3")
-    } elseif (Get-Command python -ErrorAction SilentlyContinue) {
-        $PythonMcpCommand = @("python")
+    if ($env:AGENT_BRIDGE_PYTHON) {
+        & $env:AGENT_BRIDGE_PYTHON -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+        if ($LASTEXITCODE -ne 0) {
+            throw "AGENT_BRIDGE_PYTHON is not a usable Python 3.11+ interpreter."
+        }
+        $PythonMcpCommand = @($env:AGENT_BRIDGE_PYTHON)
+    } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+        & py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+        if ($LASTEXITCODE -eq 0) {
+            $PythonMcpCommand = @("py", "-3")
+        }
+    }
+    if ($PythonMcpCommand.Count -eq 0 -and (Get-Command python -ErrorAction SilentlyContinue)) {
+        & python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+        if ($LASTEXITCODE -eq 0) {
+            $PythonMcpCommand = @("python")
+        }
     }
 
     if ($PythonMcpCommand.Count -eq 0) {
-        Write-Warning "No Python command found on PATH; skipped MCP registration."
+        throw "Python 3.11 or newer is required for MCP registration. Set AGENT_BRIDGE_PYTHON or install a supported Python."
     }
 
     if (Get-Command claude -ErrorAction SilentlyContinue) {

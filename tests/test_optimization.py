@@ -157,7 +157,7 @@ class OptimizationTests(unittest.TestCase):
                     compression_mode="trim",
                     compression_max_chars=80,
                 )
-                second = run_workflow(
+                run_workflow(
                     workflow_id="deep-research-lite",
                     question="fixture question",
                     tier="shallow",

@@ -14,8 +14,9 @@
 
 ## Checks
 
-- [ ] `python3 -m py_compile agent_bridge/*.py`
-- [ ] `python3 -m unittest discover -s tests`
+- [ ] `python3.11 -m py_compile agent_bridge/*.py` (or another Python 3.11+ interpreter)
+- [ ] `python3.11 -m unittest discover -s tests` (or another Python 3.11+ interpreter)
+- [ ] `ruff check agent_bridge tests` and `mypy` (incremental: `state_sync.py` only)
 - [ ] `git diff --check`
 - [ ] Tests added that would fail without this change
 - [ ] No new runtime dependency

@@ -25,7 +25,10 @@ one product's private conversation history into another product's history.
 - `agent code state-sync` — retention-safe, append-aware Codex session and project synchronization
   through a private OneDrive `SharedAgentData` root.
 
-The Python runtime uses the standard library only and requires Python 3.11 or newer.
+The Python runtime uses the standard library only and requires Python 3.11 or newer. The Unix
+launcher checks every `python3` and versioned `python3.*` executable on `PATH`, including future
+Python 3 releases. Set `AGENT_BRIDGE_PYTHON` to an absolute interpreter path to override that
+selection; the launcher fails with an actionable error rather than running on an older Python.
 
 ## 90-second demo
 
@@ -107,12 +110,15 @@ agent code hooks uninstall --client all
 Register the local mailbox MCP with either supported CLI:
 
 ```bash
-codex mcp add mailbox -- python3 "$PWD/agent_bridge/mailbox_mcp.py"
-claude mcp add --scope user mailbox -- python3 "$PWD/agent_bridge/mailbox_mcp.py"
+MCP_PYTHON="${AGENT_BRIDGE_PYTHON:-python3}"
+"$MCP_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'
+codex mcp add mailbox -- "$MCP_PYTHON" "$PWD/agent_bridge/mailbox_mcp.py"
+claude mcp add --scope user mailbox -- "$MCP_PYTHON" "$PWD/agent_bridge/mailbox_mcp.py"
 ```
 
 Run those commands from the cloned Agent Bridge repository so the registered path is absolute and
-stable.
+stable. Both direct mailbox executables repeat the Python 3.11+ check at startup, so a stale
+registration fails actionably instead of entering the server on an unsupported runtime.
 
 ## Common operations
 
@@ -194,9 +200,18 @@ vendor CLI may still be transmitted under that tool's own account, privacy, and 
 ## Development
 
 ```bash
-python3 -m py_compile agent_bridge/*.py
-python3 -m unittest discover -s tests
+# Use any installed Python 3.11+ command (for example, python3.11 or python3.14).
+python3.11 -m py_compile agent_bridge/*.py
+python3.11 -m unittest discover -s tests
+python3.11 -m pip install --require-hashes --requirement requirements-quality.txt
+python3.11 -m ruff check agent_bridge tests
+python3.11 -m mypy
 ```
+
+Ruff checks the repository for high-signal correctness issues. Mypy is deliberately incremental:
+its current configured scope is only `agent_bridge/state_sync.py`, not a repository-wide type-safety
+claim. `requirements-quality.txt` is a fully resolved, hash-checked Python 3.11 lock generated from
+the direct pins in `requirements-quality.in`.
 
 Runtime state is stored outside the repository under `~/.local/state/agent-bridge/` by default. Set
 `AGENT_BRIDGE_STATE_DIR` to use another local location.

@@ -1098,6 +1098,7 @@ class BridgeCliTests(unittest.TestCase):
             env = {
                 **os.environ,
                 "PATH": f"{root}:/usr/bin:/bin",
+                "AGENT_BRIDGE_PYTHON": sys.executable,
                 "CODEX_BIN": str(fake_codex),
                 "AGENT_BRIDGE_STATE_DIR": str(root / "state"),
                 "AGENT_BRIDGE_EXPECTED_GITHUB_LOGIN": "test-login",
@@ -1154,6 +1155,7 @@ class BridgeCliTests(unittest.TestCase):
                 **os.environ,
                 "HOME": str(root),
                 "PATH": f"{root}:/usr/bin:/bin",
+                "AGENT_BRIDGE_PYTHON": sys.executable,
                 "CODEX_BIN": str(fake_codex),
                 "AGENT_BRIDGE_STATE_DIR": str(root / "state"),
                 "AGENT_BRIDGE_READINESS_CONFIG": str(root / "readiness.json"),

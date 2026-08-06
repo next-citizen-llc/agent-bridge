@@ -22,6 +22,8 @@ one product's private conversation history into another product's history.
 - `agent workflow` — portable multi-phase workflows with stored manifests and results.
 - `mailbox_mcp.py` — a dependency-free local JSON-RPC mailbox, findings, verdict, and trace store.
 - `agent code sessions` — bounded, redacted continuation handoffs from local session evidence.
+- `agent code state-sync` — retention-safe, append-aware Codex session and project synchronization
+  through a private OneDrive `SharedAgentData` root.
 
 The Python runtime uses the standard library only and requires Python 3.11 or newer.
 
@@ -143,6 +145,25 @@ Inspect recent native-session evidence without importing raw chat history:
 agent code sessions inventory --since-hours 168
 ```
 
+Publish the first Codex baseline and later compressed chunk deltas, or inspect
+what each machine has made available:
+
+```bash
+agent code state-sync publish
+agent code state-sync status
+```
+
+Import is additive, requires Codex Desktop to be closed, and first backs up the
+target metadata:
+
+```bash
+agent code state-sync apply --dry-run
+agent code state-sync apply --yes
+```
+
+See [Codex session and project state sync](docs/codex-sidebar-state-sync.md) for
+the Mac/Windows scheduler, path mapping, retention, and conflict workflow.
+
 Agent Bridge targets the current Git root by default. Use `--project-dir /absolute/path` to target a
 different checkout.
 
@@ -156,6 +177,8 @@ different checkout.
   generated harness context.
 - [Active session recovery](docs/active-session-recovery.md) documents bounded continuation
   handoffs.
+- [Codex state sync](docs/codex-sidebar-state-sync.md) documents append-aware session and project
+  synchronization without recurring full-state replacement.
 
 Agent Bridge is a local-first control plane, not a local-inference guarantee. Prompts sent to a
 vendor CLI may still be transmitted under that tool's own account, privacy, and retention terms.

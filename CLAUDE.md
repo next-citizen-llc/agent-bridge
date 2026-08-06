@@ -30,6 +30,11 @@ bin/agent code sessions inventory --since-hours 168
 python3 -m py_compile agent_bridge/*.py
 python3 -m unittest discover -s tests
 
+# Pinned quality tools; Mypy is deliberately incremental and checks state_sync.py only
+python3 -m pip install --require-hashes --requirement requirements-quality.txt
+python3 -m ruff check agent_bridge tests
+python3 -m mypy
+
 # A single test module / case / method
 python3 -m unittest tests.test_mailbox
 python3 -m unittest tests.test_coord.SomeTestCase
@@ -39,8 +44,10 @@ python3 -m unittest tests.test_workflow.SomeTestCase.test_something
 scripts/install.sh          # scripts/install.ps1 on Windows
 ```
 
-There is no lint/format config and no Makefile. `pyproject.toml` exposes the console script
-`agent = agent_bridge.cli:main_entry`.
+`pyproject.toml` contains a conservative Ruff correctness gate and an incremental Mypy gate scoped
+to `state_sync.py`; direct pins live in `requirements-quality.in`, and CI installs the resolved,
+hash-checked `requirements-quality.txt` lock. There is no Makefile. `pyproject.toml` exposes the
+console script `agent = agent_bridge.cli:main_entry`.
 
 ## Hard constraints
 

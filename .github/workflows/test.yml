@@ -33,6 +33,19 @@ jobs:
       - run: python -m py_compile agent_bridge/*.py
       - run: python -m unittest discover -s tests
 
+  quality:
+    name: Lint and incremental state-sync type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --require-hashes --requirement requirements-quality.txt
+      - run: python -m ruff check agent_bridge tests
+      - name: Mypy (incremental; state_sync.py only)
+        run: python -m mypy
+
   package:
     name: Package metadata
     runs-on: ubuntu-latest

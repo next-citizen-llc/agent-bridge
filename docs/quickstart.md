@@ -128,8 +128,10 @@ deliberately removes them.
 From the cloned repository:
 
 ```bash
-codex mcp add mailbox -- python3 "$PWD/agent_bridge/mailbox_mcp.py"
-claude mcp add --scope user mailbox -- python3 "$PWD/agent_bridge/mailbox_mcp.py"
+MCP_PYTHON="${AGENT_BRIDGE_PYTHON:-python3}"
+"$MCP_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'
+codex mcp add mailbox -- "$MCP_PYTHON" "$PWD/agent_bridge/mailbox_mcp.py"
+claude mcp add --scope user mailbox -- "$MCP_PYTHON" "$PWD/agent_bridge/mailbox_mcp.py"
 ```
 
 Registration changes the selected CLI's user configuration and is therefore separate from the

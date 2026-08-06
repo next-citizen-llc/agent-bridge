@@ -894,7 +894,7 @@ def coord_cmd(command: str, argv: list[str]) -> int:
 
 
 def _capabilities_cmd(argv: list[str]) -> int:
-    from .cli import BRIDGE_DIR, agent_map, load_config, DEFAULT_CONFIG
+    from .cli import BRIDGE_DIR, load_config, DEFAULT_CONFIG
 
     parser = argparse.ArgumentParser(prog="agent code capabilities", description="Emit portable capability cards for configured harness targets.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))

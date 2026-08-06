@@ -118,6 +118,16 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Normalize schema-varying JSON object fields at their read boundary."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    """Normalize schema-varying JSON array fields at their read boundary."""
+    return value if isinstance(value, list) else []
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not path.is_file():
@@ -226,7 +236,7 @@ def _registry_maps(registry: dict[str, Any]) -> tuple[dict[str, str], dict[str, 
     path_to_slug: dict[str, str] = {}
     paths_by_slug: dict[str, dict[str, list[str]]] = {}
     names: dict[str, str] = {}
-    projects = registry.get("projects") if isinstance(registry.get("projects"), list) else []
+    projects = _as_list(registry.get("projects"))
     for project in projects:
         if not isinstance(project, dict):
             continue
@@ -307,8 +317,8 @@ def _ordered_project_ids(state: dict[str, Any]) -> list[str]:
 
 def _project_records(state: dict[str, Any], registry: dict[str, Any]) -> list[dict[str, Any]]:
     path_to_slug, _, registry_names = _registry_maps(registry)
-    local_projects = state.get("local-projects") if isinstance(state.get("local-projects"), dict) else {}
-    labels = state.get("electron-workspace-root-labels") if isinstance(state.get("electron-workspace-root-labels"), dict) else {}
+    local_projects = _as_dict(state.get("local-projects"))
+    labels = _as_dict(state.get("electron-workspace-root-labels"))
     order = _ordered_project_ids(state)
     records: list[dict[str, Any]] = []
 
@@ -401,14 +411,14 @@ def _thread_project(
     ui_state: dict[str, Any],
     registry: dict[str, Any],
 ) -> tuple[str, str]:
-    assignments = ui_state.get("thread-project-assignments") if isinstance(ui_state.get("thread-project-assignments"), dict) else {}
-    assignment = assignments.get(thread_id) if isinstance(assignments.get(thread_id), dict) else {}
+    assignments = _as_dict(ui_state.get("thread-project-assignments"))
+    assignment = _as_dict(assignments.get(thread_id))
     source_project_id = str(assignment.get("projectId") or "")
     for project in projects:
         if source_project_id and project.get("source_project_id") == source_project_id:
             return str(project.get("project_slug") or ""), source_project_id
     for project in projects:
-        roots = project.get("source_roots") if isinstance(project.get("source_roots"), list) else []
+        roots = _as_list(project.get("source_roots"))
         if any(_path_is_within(cwd, str(root)) for root in roots):
             return str(project.get("project_slug") or ""), str(project.get("source_project_id") or "")
     path_to_slug, _, _ = _registry_maps(registry)
@@ -750,7 +760,7 @@ def _publish_codex_state_unlocked(
                 and previous.get("mtime_ns") == stat.st_mtime_ns
                 and _row_objects_exist(archive, previous)
             )
-            if unchanged:
+            if unchanged and previous is not None:
                 row = dict(previous)
                 row["source_present"] = True
                 row.pop("deferred_update", None)
@@ -828,10 +838,10 @@ def _publish_codex_state_unlocked(
         artifact_rows = previous_rows
 
     artifacts_by_thread: dict[str, list[dict[str, Any]]] = {}
-    for artifact in artifact_rows:
-        thread_id = str(artifact.get("thread_id") or "")
-        if thread_id and artifact.get("source_present", True) and not artifact.get("deferred_update"):
-            artifacts_by_thread.setdefault(thread_id, []).append(artifact)
+    for artifact_row in artifact_rows:
+        thread_id = str(artifact_row.get("thread_id") or "")
+        if thread_id and artifact_row.get("source_present", True) and not artifact_row.get("deferred_update"):
+            artifacts_by_thread.setdefault(thread_id, []).append(artifact_row)
 
     thread_rows: list[dict[str, Any]] = []
     for thread in threads:
@@ -840,14 +850,11 @@ def _publish_codex_state_unlocked(
             continue
         rollout_path = str(thread.get("rollout_path") or "")
         artifact_candidates = artifacts_by_thread.get(thread_id, [])
-        artifact = next(
-            (
-                row
-                for row in artifact_candidates
-                if _path_key(str(home / str(row.get("relative_path") or ""))) == _path_key(rollout_path)
-            ),
-            artifact_candidates[0] if artifact_candidates else None,
-        )
+        artifact: dict[str, Any] | None = artifact_candidates[0] if artifact_candidates else None
+        for candidate in artifact_candidates:
+            if _path_key(str(home / str(candidate.get("relative_path") or ""))) == _path_key(rollout_path):
+                artifact = candidate
+                break
         if artifact is None:
             previous_thread = previous_threads_by_id.get(thread_id)
             if previous_thread and any(
@@ -899,7 +906,7 @@ def _publish_codex_state_unlocked(
     unique_chunks: dict[str, dict[str, Any]] = {}
     active_chunks: dict[str, dict[str, Any]] = {}
     for row in artifact_rows:
-        for chunk in row.get("chunks") if isinstance(row.get("chunks"), list) else []:
+        for chunk in _as_list(row.get("chunks")):
             if not isinstance(chunk, dict) or not chunk.get("sha256"):
                 continue
             unique_chunks.setdefault(str(chunk["sha256"]), chunk)
@@ -1054,7 +1061,7 @@ def _map_projects_for_target(
         name = str(source.get("name") or source.get("project_slug") or "project")
         existing = target_by_logical.get(logical.casefold()) or target_by_name.get(name.casefold())
         if existing:
-            roots = existing.get("source_roots") if isinstance(existing.get("source_roots"), list) else []
+            roots = _as_list(existing.get("source_roots"))
             target_path = str(roots[0]) if roots else str(existing.get("primary_root") or "")
             mapping[source_id] = {
                 "project_id": str(existing.get("source_project_id") or ""),
@@ -1062,24 +1069,25 @@ def _map_projects_for_target(
                 "name": str(existing.get("name") or name),
                 "logical_id": logical,
                 "project_slug": str(source.get("project_slug") or ""),
-                "source_roots": [str(root) for root in source.get("source_roots", []) if isinstance(root, str)],
+                "source_roots": [str(root) for root in _as_list(source.get("source_roots")) if isinstance(root, str)],
             }
             continue
 
-        roots = source.get("source_roots") if isinstance(source.get("source_roots"), list) else []
+        roots = _as_list(source.get("source_roots"))
         primary = str(source.get("primary_root") or (roots[0] if roots else ""))
-        target_path = _apply_explicit_path_map(primary, path_maps)
-        if not target_path:
-            target_path = _preferred_registry_path(
+        resolved_path: str | None = _apply_explicit_path_map(primary, path_maps)
+        if not resolved_path:
+            resolved_path = _preferred_registry_path(
                 str(source.get("project_slug") or ""),
                 paths_by_slug,
                 platform_name=platform_name,
             )
-        if not target_path:
-            target_path = _fallback_target_path(primary, source, platform_name=platform_name)
+        if not resolved_path:
+            resolved_path = _fallback_target_path(primary, source, platform_name=platform_name)
             warnings.append(
-                f"project {name!r} has no {platform_name} registry mapping; using expected path {target_path}"
+                f"project {name!r} has no {platform_name} registry mapping; using expected path {resolved_path}"
             )
+        target_path = resolved_path
         digest = hashlib.sha256(f"{logical}|{_path_key(target_path, platform_name=platform_name)}".encode("utf-8")).hexdigest()[:32]
         target_id = f"local-{digest}"
         if target_id in used_ids:
@@ -1109,18 +1117,14 @@ def _map_source_path(
         return explicit
     project = project_mapping.get(source_project_id)
     if project is None and project_slug:
-        project = next(
-            (
-                row
-                for row in project_mapping.values()
-                if str(row.get("project_slug") or "").casefold() == project_slug.casefold()
-            ),
-            None,
-        )
+        for candidate in project_mapping.values():
+            if str(candidate.get("project_slug") or "").casefold() == project_slug.casefold():
+                project = candidate
+                break
     if project and project.get("path"):
         target_root = str(project["path"])
         normalized_value = str(value or "").replace("\\", "/").rstrip("/")
-        roots = project.get("source_roots") if isinstance(project.get("source_roots"), list) else []
+        roots = _as_list(project.get("source_roots"))
         roots = sorted((str(root) for root in roots if root), key=lambda root: len(_path_key(root)), reverse=True)
         for root in roots:
             normalized_root = root.replace("\\", "/").rstrip("/")
@@ -1144,7 +1148,7 @@ def _load_source_machine(archive: Path, source_machine: str) -> dict[str, Any]:
             raise StateSyncError(f"manifest machine mismatch for {source_machine!r}")
         if str(manifest.get("schema_version") or "").split(".", 1)[0] != SCHEMA_VERSION.split(".", 1)[0]:
             raise StateSyncError(f"unsupported state-sync schema for machine {source_machine!r}")
-        hashes = manifest.get("metadata_sha256") if isinstance(manifest.get("metadata_sha256"), dict) else {}
+        hashes = _as_dict(manifest.get("metadata_sha256"))
         bodies: dict[str, bytes] = {}
         try:
             for name in ("artifact-index.jsonl", "project-index.jsonl", "thread-index.jsonl", "ui-state.json"):
@@ -1314,7 +1318,7 @@ def _artifact_descriptor_file(path: Path) -> tuple[str, int]:
 
 
 def _reconstruct_artifact(archive: Path, row: dict[str, Any], destination: Path) -> None:
-    chunks = row.get("chunks") if isinstance(row.get("chunks"), list) else []
+    chunks = _as_list(row.get("chunks"))
     expected_id = str(row.get("artifact_id") or "")
     expected_size = int(row.get("size") or 0)
     if not re.fullmatch(r"[0-9a-f]{64}", expected_id) or (not chunks and expected_size != 0):
@@ -1446,7 +1450,7 @@ def _merge_thread_rows(
         if not columns:
             raise StateSyncError(f"threads table missing from {db_path}")
         for envelope in remote_threads:
-            thread = envelope.get("thread") if isinstance(envelope.get("thread"), dict) else {}
+            thread = _as_dict(envelope.get("thread"))
             thread_id = str(envelope.get("thread_id") or thread.get("id") or "")
             source_machine = str(envelope.get("source_machine") or "")
             if not thread_id:
@@ -1566,7 +1570,7 @@ def _merge_session_index(codex_home: Path, remote_threads: list[dict[str, Any]])
     added = 0
     seen_remote_ids: set[str] = set()
     for envelope in remote_threads:
-        thread = envelope.get("thread") if isinstance(envelope.get("thread"), dict) else {}
+        thread = _as_dict(envelope.get("thread"))
         thread_id = str(envelope.get("thread_id") or thread.get("id") or "")
         if not thread_id or thread_id in seen_remote_ids:
             continue
@@ -1674,8 +1678,8 @@ def _merge_ui_state(
             if target_path:
                 labels.setdefault(target_path, target_name)
 
-        source_ui = source.get("ui_state") if isinstance(source.get("ui_state"), dict) else {}
-        source_assignments = source_ui.get("thread-project-assignments") if isinstance(source_ui.get("thread-project-assignments"), dict) else {}
+        source_ui = _as_dict(source.get("ui_state"))
+        source_assignments = _as_dict(source_ui.get("thread-project-assignments"))
         for thread_id, assignment in source_assignments.items():
             if (
                 thread_id not in imported_thread_ids
@@ -1704,7 +1708,7 @@ def _merge_ui_state(
             }
             hints[thread_id] = mapped_cwd
 
-        source_orders = source_ui.get("sidebar-project-thread-orders") if isinstance(source_ui.get("sidebar-project-thread-orders"), dict) else {}
+        source_orders = _as_dict(source_ui.get("sidebar-project-thread-orders"))
         for source_project_id, thread_order in source_orders.items():
             target = mapping.get(str(source_project_id))
             if not target or not isinstance(thread_order, list):
@@ -1719,10 +1723,10 @@ def _merge_ui_state(
                     current_order.append(thread_id)
             sidebar_orders[target["project_id"]] = current_order
 
-        for thread_id in source_ui.get("pinned-thread-ids", []) if isinstance(source_ui.get("pinned-thread-ids"), list) else []:
+        for thread_id in _as_list(source_ui.get("pinned-thread-ids")):
             if thread_id in imported_thread_ids and thread_id not in pinned:
                 pinned.append(thread_id)
-        for thread_id in source_ui.get("projectless-thread-ids", []) if isinstance(source_ui.get("projectless-thread-ids"), list) else []:
+        for thread_id in _as_list(source_ui.get("projectless-thread-ids")):
             if (
                 thread_id in imported_thread_ids
                 and thread_source_machines.get(str(thread_id)) == machine
@@ -1850,7 +1854,7 @@ def apply_codex_state(
         project_mapping_by_machine[machine] = mapping
         warnings.extend(mapping_warnings)
 
-    summary = {
+    summary: dict[str, Any] = {
         "ok": True,
         "status": "dry_run" if dry_run else "applied",
         "sources": selected,

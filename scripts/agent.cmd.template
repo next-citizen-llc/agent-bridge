@@ -1,0 +1,28 @@
+@echo off
+setlocal
+set "PYTHONPATH=__AGENT_BRIDGE_PROJECT_DIR__;%PYTHONPATH%"
+if not "%AGENT_BRIDGE_PYTHON%"=="" goto configured_python
+where py >NUL 2>NUL
+if errorlevel 1 goto python_command
+py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >NUL 2>NUL
+if errorlevel 1 goto python_command
+py -3 -m agent_bridge.cli %*
+exit /b %ERRORLEVEL%
+:python_command
+where python >NUL 2>NUL
+if errorlevel 1 goto unsupported_python
+python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >NUL 2>NUL
+if errorlevel 1 goto unsupported_python
+python -m agent_bridge.cli %*
+exit /b %ERRORLEVEL%
+:configured_python
+"%AGENT_BRIDGE_PYTHON%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >NUL 2>NUL
+if errorlevel 1 goto unsupported_configured_python
+"%AGENT_BRIDGE_PYTHON%" -m agent_bridge.cli %*
+exit /b %ERRORLEVEL%
+:unsupported_configured_python
+echo agent: AGENT_BRIDGE_PYTHON is not a usable Python 3.11+ interpreter. 1>&2
+exit /b 1
+:unsupported_python
+echo agent: Python 3.11 or newer is required. Install a supported Python or set AGENT_BRIDGE_PYTHON. 1>&2
+exit /b 1

@@ -18,6 +18,13 @@ import json
 import os
 
 try:
+    from .python_runtime import require_supported_python
+except ImportError:
+    from python_runtime import require_supported_python  # type: ignore[no-redef]
+
+require_supported_python("mailbox.py")
+
+try:
     from .correlation import add_meta_args, extract_meta, format_meta, iso_now, match_meta
     from .trace import emit_event
 except ImportError:
@@ -188,10 +195,10 @@ def main(argv=None) -> int:
     r.add_argument("--full", action="store_true")
     add_meta_args(r, filters_only=True)
     r.set_defaults(func=cmd_read)
-    l = sub.add_parser("last")
-    l.add_argument("--to", default=None)
-    add_meta_args(l, filters_only=True)
-    l.set_defaults(func=cmd_last)
+    last = sub.add_parser("last")
+    last.add_argument("--to", default=None)
+    add_meta_args(last, filters_only=True)
+    last.set_defaults(func=cmd_last)
     args = p.parse_args(argv)
     return args.func(args)
 

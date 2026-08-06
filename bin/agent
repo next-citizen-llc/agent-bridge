@@ -11,4 +11,39 @@ done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
-exec python3 -m agent_bridge.cli "$@"
+
+minimum_python="3.11"
+
+is_supported_python() {
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1
+}
+
+python_version() {
+  "$1" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null || "$1" --version 2>/dev/null || true
+}
+
+if [[ -n "${AGENT_BRIDGE_PYTHON:-}" ]]; then
+  if is_supported_python "$AGENT_BRIDGE_PYTHON"; then
+    exec "$AGENT_BRIDGE_PYTHON" -m agent_bridge.cli "$@"
+  fi
+  printf 'agent: AGENT_BRIDGE_PYTHON=%q is not a usable Python %s+ interpreter (found %s).\n' \
+    "$AGENT_BRIDGE_PYTHON" "$minimum_python" "$(python_version "$AGENT_BRIDGE_PYTHON")" >&2
+  exit 1
+fi
+
+# Scan every PATH entry rather than stopping at the first (possibly old) macOS
+# system python3. Versioned python3.* names are intentionally unbounded so a
+# future supported Python does not require a launcher update.
+IFS=: read -r -a python_path_entries <<< "${PATH:-}"
+for python_path_entry in "${python_path_entries[@]}"; do
+  [[ -n "$python_path_entry" ]] || python_path_entry=.
+  for candidate in "$python_path_entry/python3" "$python_path_entry"/python3.*; do
+    if [[ -x "$candidate" && ! -d "$candidate" ]] && is_supported_python "$candidate"; then
+      exec "$candidate" -m agent_bridge.cli "$@"
+    fi
+  done
+done
+
+printf 'agent: Python %s or newer is required. Install a supported Python and put it on PATH, or set AGENT_BRIDGE_PYTHON to its absolute path.\n' \
+  "$minimum_python" >&2
+exit 1

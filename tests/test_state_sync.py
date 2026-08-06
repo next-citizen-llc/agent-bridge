@@ -18,6 +18,7 @@ from agent_bridge.state_sync import (
     _atomic_write_bytes,
     _codex_desktop_running,
     _macos_plist,
+    _merge_session_index,
     _publisher_lock,
     _scheduler_arguments,
     apply_codex_state,
@@ -471,6 +472,72 @@ class StateSyncTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b"ok\n")
             self.assertEqual(attempts, 3)
             self.assertEqual(list(destination.parent.glob(".*.tmp")), [])
+
+    def test_session_index_merge_preserves_unrelated_lines_duplicates_and_future_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = home / "session_index.jsonl"
+            original = (
+                b'{"id":"existing","thread_name":"Local","updated_at":"2030-01-01T00:00:00Z","future":{"keep":true}}\n'
+                b'not valid json\n'
+                b'["non-object", 1]\n'
+                b'{"id":"existing","thread_name":"Older duplicate","updated_at":"2029-01-01T00:00:00Z"}\n'
+                b'{"id":"local-only","thread_name":"Keep me","updated_at":"2032-01-01T00:00:00Z"}\n'
+            )
+            path.write_bytes(original)
+
+            added = _merge_session_index(
+                home,
+                [
+                    {
+                        "thread_id": "existing",
+                        "thread": {"id": "existing", "title": "Remote newer", "updated_at_ms": 1_925_000_000_000},
+                    },
+                    {
+                        "thread_id": "remote-only",
+                        "thread": {"id": "remote-only", "title": "Imported", "updated_at_ms": 1_925_000_000_000},
+                    },
+                ],
+            )
+
+            self.assertEqual(added, 1)
+            lines = path.read_bytes().splitlines(keepends=True)
+            self.assertEqual(lines[1:5], original.splitlines(keepends=True)[1:5])
+            updated = json.loads(lines[0])
+            self.assertEqual(updated["thread_name"], "Remote newer")
+            self.assertEqual(updated["future"], {"keep": True})
+            self.assertNotIn("updated_at_ms", updated)
+            self.assertEqual(json.loads(lines[-1])["id"], "remote-only")
+
+    def test_same_size_session_rewrite_is_rechunked_not_treated_as_append(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shared = root / "SharedAgentData"
+            source_home, _, session, registry = self._source_fixture(root)
+            publish_codex_state(
+                codex_home=source_home,
+                shared_root=shared,
+                project_registry=registry,
+                machine_id="source-machine",
+                settle_seconds=0,
+            )
+            original_size = session.stat().st_size
+            session.write_bytes((b"y" * CHUNK_SIZE) + b'{"type":"user","text":"first"}\n')
+            self.assertEqual(session.stat().st_size, original_size)
+
+            rewritten = publish_codex_state(
+                codex_home=source_home,
+                shared_root=shared,
+                project_registry=registry,
+                machine_id="source-machine",
+                settle_seconds=0,
+            )
+
+            # The unchanged tail chunk can still deduplicate, but a same-size
+            # rewrite must not reuse the old first chunk as an append prefix.
+            self.assertEqual(rewritten["reused_objects"], 1)
+            self.assertGreaterEqual(rewritten["new_objects"], 1)
+            self.assertGreater(rewritten["new_stored_bytes"], 0)
 
     def test_publisher_lock_refuses_concurrent_metadata_writers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(

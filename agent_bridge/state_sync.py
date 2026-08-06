@@ -10,7 +10,9 @@ mergeable alternative:
 * optional periodic publication through LaunchAgent or Task Scheduler.
 
 No native log database, credentials, config file, or cache is published.  No
-session object is deleted automatically.
+session object is deleted automatically. Included session artifacts are copied
+as-is: this is a trusted-private-root archive, not encrypted storage, content
+redaction, or cryptographically authenticated replication.
 """
 
 from __future__ import annotations
@@ -1537,14 +1539,38 @@ def _merge_thread_rows(
 
 def _merge_session_index(codex_home: Path, remote_threads: list[dict[str, Any]]) -> int:
     path = codex_home / "session_index.jsonl"
-    existing_rows = _read_jsonl(path)
-    by_id = {str(row.get("id") or ""): row for row in existing_rows if row.get("id")}
+    try:
+        raw_lines = path.read_bytes().splitlines(keepends=True) if path.is_file() else []
+    except OSError:
+        raw_lines = []
+
+    # session_index.jsonl is native state.  Keep every original physical line
+    # unless this merge genuinely updates its matching object.  In particular,
+    # a tolerant reader followed by a normalized rewrite would silently erase
+    # malformed JSON, scalar JSON values, duplicates, and future fields.
+    parsed_rows: list[tuple[int, dict[str, Any]]] = []
+    for position, raw_line in enumerate(raw_lines):
+        try:
+            value = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and value.get("id"):
+            parsed_rows.append((position, value))
+
+    by_id: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for position, row in parsed_rows:
+        by_id.setdefault(str(row["id"]), []).append((position, row))
+
+    replacements: dict[int, bytes] = {}
+    appended: list[dict[str, Any]] = []
     added = 0
+    seen_remote_ids: set[str] = set()
     for envelope in remote_threads:
         thread = envelope.get("thread") if isinstance(envelope.get("thread"), dict) else {}
         thread_id = str(envelope.get("thread_id") or thread.get("id") or "")
-        if not thread_id:
+        if not thread_id or thread_id in seen_remote_ids:
             continue
+        seen_remote_ids.add(thread_id)
         updated_ms = _thread_timestamp(thread)
         updated_at = datetime.fromtimestamp(updated_ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z") if updated_ms else ""
         row = {
@@ -1552,12 +1578,46 @@ def _merge_session_index(codex_home: Path, remote_threads: list[dict[str, Any]])
             "thread_name": str(thread.get("title") or thread.get("name") or thread.get("preview") or "Imported session"),
             "updated_at": updated_at,
         }
-        current = by_id.get(thread_id)
-        if current is None or str(row.get("updated_at") or "") > str(current.get("updated_at") or ""):
-            by_id[thread_id] = row
-            added += int(current is None)
-    _atomic_write_jsonl(path, sorted(by_id.values(), key=lambda row: (str(row.get("updated_at") or ""), str(row.get("id") or ""))))
+        matches = by_id.get(thread_id, [])
+        if not matches:
+            appended.append(row)
+            added += 1
+            continue
+
+        # Preserve duplicate rows.  When a remote index is newer, update only
+        # the freshest matching object and retain all of its unknown fields.
+        position, current = max(matches, key=lambda item: (_session_index_timestamp(item[1]), item[0]))
+        if updated_ms > _session_index_timestamp(current):
+            merged = dict(current)
+            merged.update(row)
+            newline = b"\r\n" if raw_lines[position].endswith(b"\r\n") else b"\n"
+            replacements[position] = json.dumps(merged, sort_keys=True).encode("utf-8") + newline
+
+    if replacements or appended:
+        body = b"".join(replacements.get(position, raw_line) for position, raw_line in enumerate(raw_lines))
+        if appended:
+            if body and not body.endswith((b"\n", b"\r")):
+                body += b"\n"
+            body += b"".join(json.dumps(row, sort_keys=True).encode("utf-8") + b"\n" for row in appended)
+        _atomic_write_bytes(path, body)
     return added
+
+
+def _session_index_timestamp(row: dict[str, Any]) -> int:
+    """Return a comparable timestamp for native session-index objects."""
+    raw = row.get("updated_at_ms")
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    raw = row.get("updated_at")
+    if isinstance(raw, (int, float)):
+        value = int(raw)
+        return value if value > 10_000_000_000 else value * 1000
+    if not isinstance(raw, str) or not raw.strip():
+        return 0
+    try:
+        return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return 0
 
 
 def _merge_ui_state(
@@ -2114,7 +2174,11 @@ def state_sync_status(
 def state_sync_cmd(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="agent code state-sync",
-        description="Incrementally synchronize Codex sessions and project structure without replacing native state.",
+        description=(
+            "Incrementally synchronize Codex sessions and project structure without replacing native state. "
+            "Copies raw prompt/tool content, attachments, and generated images as-is; use only a trusted private root "
+            "and never apply untrusted manifests (the archive is not encrypted or cryptographically source-authenticated)."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2123,7 +2187,14 @@ def state_sync_cmd(argv: list[str]) -> int:
         command_parser.add_argument("--codex-home", help="Codex home; defaults to CODEX_HOME or ~/.codex")
         command_parser.add_argument("--project-registry", help="Optional SharedAgentConversations projects.json path")
 
-    publish = sub.add_parser("publish", help="Publish a baseline or only changed artifacts when a prior manifest exists")
+    publish = sub.add_parser(
+        "publish",
+        help="Publish a baseline or only changed artifacts when a prior manifest exists",
+        description=(
+            "Publish included Codex session artifacts as-is to a trusted private root. "
+            "The archive is not encrypted and does not scan or redact prompt, tool, attachment, or image content."
+        ),
+    )
     shared_options(publish)
     publish.add_argument("--machine-id")
     publish.add_argument("--settle-seconds", type=int, default=60)
@@ -2131,7 +2202,14 @@ def state_sync_cmd(argv: list[str]) -> int:
     publish.add_argument("--metadata-only", action="store_true")
     publish.add_argument("--quiet", action="store_true")
 
-    apply_parser = sub.add_parser("apply", help="Additively import sessions/projects from one or more machines")
+    apply_parser = sub.add_parser(
+        "apply",
+        help="Additively import sessions/projects from one or more machines",
+        description=(
+            "Additively import from a trusted private root. Metadata hashes detect damage, not source identity; "
+            "never apply an untrusted manifest."
+        ),
+    )
     shared_options(apply_parser)
     apply_parser.add_argument("--from-machine", action="append", default=[])
     apply_parser.add_argument("--machine-id", help="Override this machine identity (used by schedulers)")
@@ -2140,7 +2218,14 @@ def state_sync_cmd(argv: list[str]) -> int:
     apply_parser.add_argument("--dry-run", action="store_true")
     apply_parser.add_argument("--defer-if-running", action="store_true")
 
-    sync = sub.add_parser("sync", help="Publish local changes and optionally import remote changes")
+    sync = sub.add_parser(
+        "sync",
+        help="Publish local changes and optionally import remote changes",
+        description=(
+            "Publish raw session artifacts as-is and optionally import trusted remote manifests. "
+            "The archive is not encrypted, content-scanned, or cryptographically source-authenticated."
+        ),
+    )
     shared_options(sync)
     sync.add_argument("--pull", action="store_true")
     sync.add_argument("--machine-id", help="Override this machine identity (used by schedulers)")

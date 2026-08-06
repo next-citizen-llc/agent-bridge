@@ -31,7 +31,9 @@ The incremental format publishes only:
   `.codex-global-state.json`.
 
 It does not publish `logs_*.sqlite`, config, credentials, cookies, caches, MCP
-configuration, or the native SQLite database itself.
+configuration, or the native SQLite database itself. This is path selection,
+not content-level secret scanning: included session JSONL, attachments, and
+generated images are copied as-is and are not redacted.
 
 ## Shared layout
 
@@ -119,8 +121,13 @@ Publication can run while Codex Desktop is active. A settle window defers a
 file that is currently changing. Import requires Codex Desktop to be closed;
 `--defer-if-running` records a pending marker instead of modifying live state.
 
-Session files contain private prompt and tool history. Use only a trusted,
-private `SharedAgentData` location shared by the intended machines.
+Session files contain private prompt and tool history, and included attachments
+and generated images are copied as-is. Use only a trusted, private
+`SharedAgentData` location shared by the intended machines. The archive is not
+encrypted or cryptographically source-authenticated: metadata hashes detect
+mixed or damaged generations but do not prove who authored a manifest, and
+machine IDs are labels rather than identities. Never apply an untrusted
+manifest.
 
 ## Commands
 

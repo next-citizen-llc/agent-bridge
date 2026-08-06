@@ -18,6 +18,16 @@ The sync excludes Codex log databases, config, credentials, caches, plugins,
 MCP state, and the native SQLite database file. OneDrive carries the private
 state archive; GitHub carries the Agent Bridge code.
 
+## Trust and privacy boundary
+
+This archive copies included session JSONL, raw prompts and tool content,
+attachments, and generated images as-is. It is not encrypted and manifests are
+not cryptographically source-authenticated; machine IDs are routing labels, not
+proof of source identity. Use only a trusted, private `SharedAgentData` root
+and do not apply manifests from an untrusted source. Excluding Codex config or
+credential stores is a path-selection boundary only: it does not scan included
+session content for secrets or redact history.
+
 ## First baseline
 
 On either machine:

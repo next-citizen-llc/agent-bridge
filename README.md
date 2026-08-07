@@ -157,6 +157,10 @@ title, or generated report is packaged in this public repository. The
 self-contained HTML remains local under Agent Bridge's state directory by
 default.
 
+See the [workstream control center guide](docs/workstream-control-center.md)
+for the catalog schema, exact issue/Epic references, generation workflow,
+privacy boundary, cross-platform command semantics, and browser validation.
+
 Each workstream can prepare a resume command or continuation brief for a
 selected agent, execution surface, and machine. The report never injects into
 an existing native chat or silently executes on a remote machine; run the
@@ -175,6 +179,8 @@ different checkout.
   generated harness context.
 - [Active session recovery](docs/active-session-recovery.md) documents bounded continuation
   handoffs.
+- [Harness-engineering research](docs/research/harness-engineering-workstream-continuity.md)
+  records the evidence and open questions behind the workstream-control boundary.
 
 Agent Bridge is a local-first control plane, not a local-inference guarantee. Prompts sent to a
 vendor CLI may still be transmitted under that tool's own account, privacy, and retention terms.

@@ -74,7 +74,11 @@ def _dedupe_strings(values: Iterable[str]) -> list[str]:
 
 
 def validate_workstreams(workstreams: list[dict[str, Any]]) -> None:
-    ids = [str(row.get("id") or "") for row in workstreams]
+    if any(not isinstance(row, dict) for row in workstreams):
+        raise ValueError("each workstream must be an object")
+    ids = [row.get("id") for row in workstreams]
+    if any(not isinstance(value, str) or not value.strip() for value in ids):
+        raise ValueError("workstream ids must be non-empty strings")
     if len(ids) != len(set(ids)):
         raise ValueError("workstream ids must be unique")
     required = {"id", "title", "summary", "objectives", "projectSlugs", "repos", "evidence", "tags"}
@@ -82,8 +86,62 @@ def validate_workstreams(workstreams: list[dict[str, Any]]) -> None:
         missing = sorted(required - set(row))
         if missing:
             raise ValueError(f"workstream {row.get('id', '<unknown>')} missing: {', '.join(missing)}")
-        if row["evidence"] not in {"high", "medium", "low"}:
+        for field in ("title", "summary"):
+            if not isinstance(row[field], str) or not row[field].strip():
+                raise ValueError(f"workstream {row['id']} {field} must be a non-empty string")
+        for field in ("objectives", "projectSlugs", "repos", "tags"):
+            value = row[field]
+            if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+                raise ValueError(f"workstream {row['id']} {field} must be a list of non-empty strings")
+        if not row["objectives"]:
+            raise ValueError(f"workstream {row['id']} objectives must not be empty")
+        if not row["projectSlugs"]:
+            raise ValueError(f"workstream {row['id']} projectSlugs must not be empty")
+        if not isinstance(row["evidence"], str) or row["evidence"] not in {"high", "medium", "low"}:
             raise ValueError(f"workstream {row['id']} has invalid evidence level")
+
+
+def _require_nonnegative_int(mapping: dict[str, Any], field: str, *, context: str) -> None:
+    value = mapping.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{context} {field} must be a non-negative integer")
+
+
+def _validate_catalog_metadata(data: dict[str, Any], *, path: Path) -> None:
+    title = data.get("title")
+    if title is not None and (not isinstance(title, str) or not title.strip()):
+        raise ValueError(f"workstream catalog title must be a non-empty string: {path}")
+    inventory = data.get("inventory")
+    if not isinstance(inventory, dict):
+        raise ValueError(f"workstream catalog inventory must be an object: {path}")
+    if not isinstance(inventory.get("capturedAt"), str) or not inventory["capturedAt"].strip():
+        raise ValueError(f"workstream catalog inventory capturedAt is required: {path}")
+    for field in ("portableProjects", "portableHistoricalCheckpoints", "macCodexThreads", "macClaudeSessions"):
+        _require_nonnegative_int(inventory, field, context="workstream catalog inventory")
+    dispatches = inventory.get("bridgeDispatches")
+    if not isinstance(dispatches, dict):
+        raise ValueError(f"workstream catalog inventory bridgeDispatches must be an object: {path}")
+    for key, value in dispatches.items():
+        if not isinstance(key, str) or not key.strip() or isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"workstream catalog inventory bridgeDispatches must map names to non-negative integers: {path}")
+    limitations = inventory.get("limitations")
+    if not isinstance(limitations, list) or any(not isinstance(item, str) or not item.strip() for item in limitations):
+        raise ValueError(f"workstream catalog inventory limitations must be a list of non-empty strings: {path}")
+
+    method = data.get("method")
+    if not isinstance(method, dict):
+        raise ValueError(f"workstream catalog method must be an object: {path}")
+    principles = method.get("principles")
+    if not isinstance(principles, list) or any(not isinstance(item, str) or not item.strip() for item in principles):
+        raise ValueError(f"workstream catalog method principles must be a list of non-empty strings: {path}")
+    sources = method.get("sources")
+    if not isinstance(sources, list):
+        raise ValueError(f"workstream catalog method sources must be a list: {path}")
+    for source in sources:
+        if not isinstance(source, dict) or any(
+            not isinstance(source.get(field), str) or not source[field].strip() for field in ("title", "url")
+        ):
+            raise ValueError(f"workstream catalog method sources require non-empty title and url strings: {path}")
 
 
 def _platform_name(value: str) -> str:
@@ -126,9 +184,9 @@ def normalise_machines(registry: dict[str, Any], *, current_machine: str = "") -
         target["fresh"] = bool(target["fresh"] or row.get("fresh"))
         surface = str(row.get("surface") or "unspecified")
         target["surfaces"].add(surface)
-        client = str(row.get("client") or "").strip()
-        if client and client != "unknown":
-            target["agents"].setdefault(client, {"id": client, "label": client.title(), "modes": ["review", "code"]})
+        # A registry client identifies the reporting harness, not an executable
+        # command on this machine.  Resume choices are therefore sourced only
+        # from capability cards that positively report their command as found.
         for card in row.get("capabilities") or []:
             agent_id = str(card.get("id") or "").strip()
             if not agent_id or not card.get("command_found"):
@@ -169,12 +227,7 @@ def load_workstream_catalog(path: Path) -> dict[str, Any]:
     if not isinstance(workstreams, list) or not workstreams:
         raise ValueError(f"workstream catalog has no workstreams: {path}")
     validate_workstreams(workstreams)
-    inventory = data.get("inventory")
-    if not isinstance(inventory, dict):
-        raise ValueError(f"workstream catalog inventory must be an object: {path}")
-    method = data.get("method")
-    if not isinstance(method, dict):
-        raise ValueError(f"workstream catalog method must be an object: {path}")
+    _validate_catalog_metadata(data, path=path)
     owner = str(data.get("githubOwner") or "").strip()
     if not owner:
         raise ValueError(f"workstream catalog githubOwner is required: {path}")
@@ -223,6 +276,7 @@ def workspace_evidence(
     projects: dict[str, dict[str, Any]],
     *,
     conversations_root: Path | None = None,
+    current_machine: str = "",
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     workspaces: list[dict[str, str]] = []
     checkpoints: list[dict[str, str]] = []
@@ -247,14 +301,24 @@ def workspace_evidence(
                 harness=str(item.get("harness") or ""),
                 last_seen=str(item.get("last_seen_at") or ""),
             )
+        machines_by_os: dict[str, set[str]] = {"macos": set(), "windows": set(), "linux": set()}
+        for workspace in workspaces:
+            if workspace.get("projectSlug") == slug and workspace.get("machine") and workspace.get("os") in machines_by_os:
+                machines_by_os[workspace["os"]].add(workspace["machine"])
         for key, os_name in (("latest_mac", "macos"), ("latest_windows", "windows")):
             value = str(row.get(key) or "").strip()
             if value:
-                checkpoints.append({"path": value, "os": os_name, "projectSlug": slug})
+                checkpoint = {"path": value, "os": os_name, "projectSlug": slug}
+                if len(machines_by_os[os_name]) == 1:
+                    checkpoint["machine"] = next(iter(machines_by_os[os_name]))
+                checkpoints.append(checkpoint)
         if conversations_root:
             candidate = conversations_root / "projects" / slug / "latest.md"
             if candidate.exists():
-                checkpoints.append({"path": str(candidate), "os": "portable", "projectSlug": slug})
+                checkpoint = {"path": str(candidate), "os": "portable", "projectSlug": slug}
+                if current_machine:
+                    checkpoint["machine"] = current_machine
+                checkpoints.append(checkpoint)
 
     seen_workspaces: set[tuple[str, str]] = set()
     unique_workspaces: list[dict[str, str]] = []
@@ -339,9 +403,7 @@ def fetch_repo_issues(owner: str, repo: str, *, timeout: int = 30) -> dict[str, 
                     "type": issue_type,
                     "labels": labels,
                     "milestone": milestone,
-                    "isEpic": issue_type.lower() == "epic"
-                    or any(label["name"].lower() == "epic" for label in labels)
-                    or str(node.get("title") or "").lower().startswith(("epic:", "[epic]")),
+                    "isEpic": issue_type.lower() == "epic",
                 }
             )
         page = connection.get("pageInfo") or {}
@@ -381,6 +443,117 @@ def _sort_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _reference_values(definition: dict[str, Any], field: str) -> list[Any]:
+    """Return an optional catalog reference field as a list without coercing strings."""
+    value = definition.get(field, [])
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _normalise_catalog_reference(value: Any) -> dict[str, Any] | None:
+    """Normalise a catalog issue reference to ``{"repo": "name", "number": 123}``.
+
+    The portable catalog deliberately uses a small, explicit grammar: a string
+    ``repo#123`` (``owner/repo#123`` also works), a GitHub issue URL, or an
+    object with ``repo`` and ``number``.  Invalid values are retained as
+    unresolved report evidence instead of making an older catalog invalid.
+    """
+    repo = ""
+    number_value: Any = None
+    raw = value
+    if isinstance(value, dict):
+        repo = str(value.get("repo") or value.get("repository") or "").strip()
+        number_value = value.get("number")
+    elif isinstance(value, str):
+        text = value.strip()
+        if "github.com/" in text and "/issues/" in text:
+            suffix = text.split("github.com/", 1)[1].split("?", 1)[0].split("#", 1)[0].strip("/")
+            parts = suffix.split("/")
+            if len(parts) >= 4 and parts[-2] == "issues":
+                repo = "/".join(parts[:-2])
+                number_value = parts[-1]
+        elif "#" in text:
+            repo, number_value = (part.strip() for part in text.rsplit("#", 1))
+    if not repo:
+        return None
+    try:
+        number = int(str(number_value).strip())
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return {"repo": repo, "number": number, "ref": f"{repo}#{number}", "raw": raw}
+
+
+def _reference_repo_name(reference: dict[str, Any], github_owner: str) -> str | None:
+    parts = str(reference["repo"]).split("/")
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2 and parts[0] == github_owner:
+        return parts[1]
+    return None
+
+
+def _catalog_reference_repositories(catalog: dict[str, Any], github_owner: str) -> list[str]:
+    """Return repositories named by valid optional issueRefs/epicRefs entries."""
+    repositories: list[str] = []
+    for definition in catalog.get("workstreams") or []:
+        if not isinstance(definition, dict):
+            continue
+        for field in ("issueRefs", "epicRefs"):
+            for value in _reference_values(definition, field):
+                normalised = _normalise_catalog_reference(value)
+                if normalised:
+                    repo = _reference_repo_name(normalised, github_owner)
+                    if repo:
+                        repositories.append(repo)
+    return _dedupe_strings(repositories)
+
+
+def _resolve_catalog_references(
+    definition: dict[str, Any], github_data: dict[str, dict[str, Any]], *, github_owner: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]]]:
+    """Resolve explicit refs, keeping absent or malformed references visible."""
+    issue_index: dict[tuple[str, int], dict[str, Any]] = {}
+    for repo, result in github_data.items():
+        for issue in result.get("issues") or []:
+            issue_repo = str(issue.get("repo") or repo)
+            try:
+                issue_index[(issue_repo, int(issue.get("number") or 0))] = issue
+            except (TypeError, ValueError):
+                continue
+
+    related: dict[str, list[dict[str, Any]]] = {"issueRefs": [], "epicRefs": []}
+    unresolved: list[dict[str, str]] = []
+    seen: dict[str, set[tuple[str, int]]] = {"issueRefs": set(), "epicRefs": set()}
+    for field in ("issueRefs", "epicRefs"):
+        kind = "issue" if field == "issueRefs" else "epic"
+        for value in _reference_values(definition, field):
+            normalised = _normalise_catalog_reference(value)
+            if not normalised:
+                unresolved.append({"kind": kind, "ref": str(value), "reason": "invalid reference"})
+                continue
+            repo = _reference_repo_name(normalised, github_owner)
+            if not repo:
+                unresolved.append(
+                    {"kind": kind, "ref": normalised["ref"], "reason": f"owner must match catalog GitHub owner {github_owner}"}
+                )
+                continue
+            key = (repo, normalised["number"])
+            issue = issue_index.get(key)
+            if not issue:
+                unresolved.append({"kind": kind, "ref": normalised["ref"], "reason": "not found in refreshed GitHub data"})
+                continue
+            if field == "epicRefs" and not issue.get("isEpic"):
+                unresolved.append({"kind": kind, "ref": normalised["ref"], "reason": "resolved issue is not an Epic"})
+                continue
+            if key not in seen[field]:
+                seen[field].add(key)
+                related[field].append(issue)
+    return _sort_issues(related["issueRefs"]), _sort_issues(related["epicRefs"]), unresolved
+
+
 def build_report_data(
     *,
     catalog: dict[str, Any],
@@ -397,18 +570,21 @@ def build_report_data(
     streams: list[dict[str, Any]] = []
     for definition in workstreams:
         workspaces, checkpoints = workspace_evidence(
-            definition["projectSlugs"], project_registry, conversations_root=conversations_root
+            definition["projectSlugs"],
+            project_registry,
+            conversations_root=conversations_root,
+            current_machine=current_machine,
         )
         verified_local = local_repo_workspaces(definition, current_machine=current_machine)
         if verified_local:
             seen_paths = {row["path"] for row in verified_local}
             workspaces = verified_local + [row for row in workspaces if row["path"] not in seen_paths]
-        issues: list[dict[str, Any]] = []
+        repository_issues: list[dict[str, Any]] = []
         repositories: list[dict[str, Any]] = []
         for repo in definition["repos"]:
             repo_result = github_data.get(repo) or {"issues": [], "error": "not refreshed"}
             repo_issues = list(repo_result.get("issues") or [])
-            issues.extend(repo_issues)
+            repository_issues.extend(repo_issues)
             repositories.append(
                 {
                     "name": repo,
@@ -418,9 +594,12 @@ def build_report_data(
                     "error": str(repo_result.get("error") or ""),
                 }
             )
-        issues = _sort_issues(issues)
+        repository_issues = _sort_issues(repository_issues)
+        related_issues, related_epics, unresolved_refs = _resolve_catalog_references(
+            definition, github_data, github_owner=github_owner
+        )
         milestones: dict[str, dict[str, str]] = {}
-        for issue in issues:
+        for issue in repository_issues:
             milestone = issue.get("milestone") or {}
             title = str(milestone.get("title") or "")
             url = str(milestone.get("url") or "")
@@ -432,13 +611,24 @@ def build_report_data(
                 "repositories": repositories,
                 "workspaces": workspaces,
                 "checkpoints": checkpoints,
-                "issues": issues,
-                "epics": [issue for issue in issues if issue.get("isEpic")],
+                # ``issues`` and ``epics`` remain aliases for existing report
+                # templates.  The repository-wide association is now explicit;
+                # optional catalog refs are a separate, exact relationship.
+                "issues": repository_issues,
+                "epics": [issue for issue in repository_issues if issue.get("isEpic")],
+                "repositoryIssues": repository_issues,
+                "repositoryEpics": [issue for issue in repository_issues if issue.get("isEpic")],
+                "relatedIssues": related_issues,
+                "relatedEpics": related_epics,
+                "unresolvedRefs": unresolved_refs,
                 "milestones": list(milestones.values()),
                 "counts": {
-                    "issues": len(issues),
-                    "openIssues": sum(1 for issue in issues if issue.get("state") == "open"),
-                    "closedIssues": sum(1 for issue in issues if issue.get("state") == "closed"),
+                    "issues": len(repository_issues),
+                    "openIssues": sum(1 for issue in repository_issues if issue.get("state") == "open"),
+                    "closedIssues": sum(1 for issue in repository_issues if issue.get("state") == "closed"),
+                    "relatedIssues": len(related_issues),
+                    "relatedEpics": len(related_epics),
+                    "unresolvedRefs": len(unresolved_refs),
                     "repositories": len(repositories),
                     "checkpoints": len(checkpoints),
                 },
@@ -539,7 +729,8 @@ def workstreams_cmd(argv: list[str]) -> int:
     except (OSError, ValueError, AssertionError):
         harness_registry = {"harnesses": []}
 
-    repo_names = _dedupe_strings(repo for stream in catalog["workstreams"] for repo in stream["repos"])
+    repo_names = _dedupe_strings(repo for stream in catalog["workstreams"] for repo in stream.get("repos") or [])
+    repo_names = _dedupe_strings([*repo_names, *_catalog_reference_repositories(catalog, github_owner)])
     github_data = collect_github_issues(
         github_owner,
         repo_names,

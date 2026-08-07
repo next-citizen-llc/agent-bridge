@@ -33,6 +33,8 @@
 
     * { box-sizing: border-box; }
 
+    [hidden] { display: none !important; }
+
     html { scroll-behavior: smooth; }
 
     body {
@@ -976,6 +978,8 @@
 
       const shellQuote = (value, os) => {
         const text = String(value ?? "");
+        // Windows output is explicitly PowerShell. Single-quoted PowerShell
+        // literals avoid cmd.exe's incompatible treatment of single quotes.
         if (os === "windows") return "'" + text.replace(/'/g, "''") + "'";
         return "'" + text.replace(/'/g, "'\"'\"'") + "'";
       };
@@ -1058,11 +1062,29 @@
 
       function epicRows(stream) {
         const rows = [
-          ...stream.epics.map(issue => ({ title: `${issue.repo}#${issue.number} · ${issue.title}`, url: issue.url, kind: "Epic" })),
+          ...(stream.epics || []).map(issue => ({ title: `${issue.repo}#${issue.number} · ${issue.title}`, url: issue.url, kind: "Repository epic" })),
           ...stream.milestones.map(item => ({ title: `${item.repo} · ${item.title}`, url: item.url, kind: "Milestone" })),
         ];
         if (!rows.length) return "";
-        return `<div class="epic-strip" aria-label="Epics and milestones">${rows.map(row => `<a class="epic-link" href="${esc(safeWebUrl(row.url))}" target="_blank" rel="noreferrer"><span>${esc(row.kind)}</span><span>${esc(row.title)}</span></a>`).join("")}</div>`;
+        return `<div class="epic-strip" aria-label="Repository epics and milestones">${rows.map(row => `<a class="epic-link" href="${esc(safeWebUrl(row.url))}" target="_blank" rel="noreferrer"><span>${esc(row.kind)}</span><span>${esc(row.title)}</span></a>`).join("")}</div>`;
+      }
+
+      function relatedRows(stream) {
+        const epics = stream.relatedEpics || [];
+        const epicKeys = new Set(epics.map(issue => `${issue.repo}#${issue.number}`));
+        const rows = [
+          ...epics.map(issue => ({ title: `${issue.repo}#${issue.number} · ${issue.title}`, url: issue.url, kind: "Epic" })),
+          ...(stream.relatedIssues || [])
+            .filter(issue => !epicKeys.has(`${issue.repo}#${issue.number}`))
+            .map(issue => ({ title: `${issue.repo}#${issue.number} · ${issue.title}`, url: issue.url, kind: issue.type || "Issue" })),
+        ];
+        const unresolved = stream.unresolvedRefs || [];
+        if (!rows.length && !unresolved.length) return "";
+        return `<div>
+          <p class="subhead">Related GitHub work</p>
+          ${rows.length ? `<div class="epic-strip" aria-label="Explicitly related GitHub work">${rows.map(row => `<a class="epic-link" href="${esc(safeWebUrl(row.url))}" target="_blank" rel="noreferrer"><span>${esc(row.kind)}</span><span>${esc(row.title)}</span></a>`).join("")}</div>` : ""}
+          ${unresolved.length ? `<p class="repo-error">Unresolved catalog references: ${esc(unresolved.map(item => `${item.kind}: ${item.ref} (${item.reason})`).join(", "))}</p>` : ""}
+        </div>`;
       }
 
       function streamCard(stream, index) {
@@ -1102,8 +1124,9 @@
                 </div>
               </div>
               <div class="issue-panel">
+                ${relatedRows(stream)}
                 <div class="issue-panel-head">
-                  <p class="subhead">Related GitHub work</p>
+                  <p class="subhead">Repository issue inventory</p>
                   <div class="issue-counts"><span>${esc(stream.counts.openIssues)} open</span><span>·</span><span>${esc(stream.counts.closedIssues)} closed</span></div>
                 </div>
                 ${epicRows(stream)}
@@ -1128,8 +1151,8 @@
 
       function machineOptions() {
         const machines = report.machines.length ? report.machines : [{
-          id: "local", displayName: "This machine · unregistered", os: navigator.platform.toLowerCase().includes("win") ? "windows" : "macos", fresh: false, current: true,
-          agents: [{id:"codex",label:"Codex"},{id:"claude",label:"Claude Code"},{id:"grok",label:"Grok Build"}]
+          id: "local", hostname: "This machine", displayName: "This machine · unregistered", os: navigator.platform.toLowerCase().includes("win") ? "windows" : "macos", fresh: false, current: true,
+          agents: []
         }];
         return machines;
       }
@@ -1142,21 +1165,24 @@
         const primary = stream.projectSlugs[0];
         const exactMachine = item => item.machine && (item.machine === machine.hostname || item.machine === machine.id);
         return stream.workspaces.find(item => item.projectSlug === primary && item.os === machine.os && exactMachine(item))
-          || stream.workspaces.find(item => item.projectSlug === primary && item.os === machine.os)
           || stream.workspaces.find(item => item.os === machine.os && exactMachine(item))
-          || stream.workspaces.find(item => item.os === machine.os)
-          || stream.workspaces.find(item => item.projectSlug === primary)
-          || stream.workspaces[0]
           || null;
       }
 
       function selectedCheckpoint(stream, machine) {
-        return stream.checkpoints.find(item => item.os === "portable") || stream.checkpoints.find(item => item.os === machine.os) || stream.checkpoints[0] || null;
+        const exactMachine = item => item.machine && (item.machine === machine.hostname || item.machine === machine.id);
+        return stream.checkpoints.find(item => item.os === machine.os && exactMachine(item))
+          || stream.checkpoints.find(item => item.os === "portable" && exactMachine(item))
+          || null;
       }
 
       function populateAgents(machine, preferred) {
-        const agents = machine.agents && machine.agents.length ? machine.agents : [{id:"codex",label:"Codex"},{id:"claude",label:"Claude Code"},{id:"grok",label:"Grok Build"}];
-        $("#resume-agent").innerHTML = agents.map(agent => `<option value="${esc(agent.id)}">${esc(agent.label)}</option>`).join("");
+        const agents = machine.agents || [];
+        const select = $("#resume-agent");
+        select.disabled = agents.length === 0;
+        select.innerHTML = agents.length
+          ? agents.map(agent => `<option value="${esc(agent.id)}">${esc(agent.label)}</option>`).join("")
+          : `<option value="">No verified agent capability</option>`;
         if (preferred && agents.some(agent => agent.id === preferred)) $("#resume-agent").value = preferred;
       }
 
@@ -1169,9 +1195,9 @@
         const focus = $("#resume-focus").value.trim();
         return [
           `Resume workstream ${activeStream.id}: ${activeStream.title}.`,
-          checkpoint ? `Read the portable checkpoint at ${checkpoint.path}.` : "No portable checkpoint path was verified; reconcile project evidence before changing state.",
+          checkpoint ? `Read the checkpoint available on the selected machine at ${checkpoint.path}.` : "No checkpoint path was verified for the selected machine; reconcile project evidence before changing state.",
           workspace ? `Work only in the verified project/worktree: ${workspace}.` : "Resolve the exact project/worktree before changing files.",
-          `Target agent: ${agent}. Target machine: ${machine.displayName}.`,
+          `Target agent: ${agent || "not selected; capability unverified"}. Target machine: ${machine.displayName}.`,
           "Re-verify Git, GitHub, artifact, and external state before trusting checkpoint status. Preserve native session history. Do not duplicate completed work.",
           "Take the next genuinely incomplete objective through focused verification; keep outbound messages draft-only unless explicitly authorized.",
           focus ? `Operator focus: ${focus}` : "",
@@ -1193,18 +1219,31 @@
         let output = "";
         let label = "Command to run";
         let copyLabel = "Copy resume command";
-        if (harness === "bridge") {
-          const parts = ["agent code bridge", "--from human", `--to ${shellQuote(agent, machine.os)}`, `--mode ${mode}`];
+        let commandAvailable = Boolean(agent);
+        if (!agent && harness !== "native") {
+          output = "No command generated: the selected machine has no verified installed-agent capability card.";
+          label = "Command unavailable";
+          copyLabel = "Command unavailable";
+          $("#harness-note").textContent = "Register or refresh the selected machine before preparing an executable command.";
+        } else if (harness === "bridge") {
+          const command = machine.os === "windows" ? "& agent code bridge" : "agent code bridge";
+          const parts = [command, "--from human", `--to ${shellQuote(agent, machine.os)}`, `--mode ${mode}`];
           if (workspace) parts.push(`--project-dir ${shellQuote(workspace, machine.os)}`);
           parts.push(`--prompt ${shellQuote(brief, machine.os)}`);
           output = parts.join(" ");
-          $("#harness-note").textContent = "Runs one bounded headless turn when executed on the selected machine.";
+          if (machine.os === "windows") {
+            label = "PowerShell command to run";
+            copyLabel = "Copy PowerShell command";
+          }
+          $("#harness-note").textContent = `Runs one bounded headless turn when executed ${machine.os === "windows" ? "in PowerShell " : ""}on the selected machine.`;
         } else if (harness === "ledger") {
-          output = `agent code tasks create --title ${shellQuote(`${activeStream.id}: ${activeStream.title}`, machine.os)} --run-id ${shellQuote(`workstream-${activeStream.id}`, machine.os)} --owner ${shellQuote(`${machine.id}/${agent}`, machine.os)}`;
-          label = "Durable ledger command";
-          copyLabel = "Copy ledger command";
+          const command = machine.os === "windows" ? "& agent code tasks create" : "agent code tasks create";
+          output = `${command} --title ${shellQuote(`${activeStream.id}: ${activeStream.title}`, machine.os)} --run-id ${shellQuote(`workstream-${activeStream.id}`, machine.os)} --owner ${shellQuote(`${machine.id}/${agent}`, machine.os)}`;
+          label = machine.os === "windows" ? "Durable ledger PowerShell command" : "Durable ledger command";
+          copyLabel = machine.os === "windows" ? "Copy ledger PowerShell command" : "Copy ledger command";
           $("#harness-note").textContent = "Records a durable task. It does not itself launch an agent or native chat.";
         } else {
+          commandAvailable = true;
           output = brief;
           label = "Continuation brief";
           copyLabel = "Copy continuation brief";
@@ -1213,7 +1252,8 @@
         $("#resume-command").textContent = output;
         $("#command-label").textContent = label;
         $("#copy-command").textContent = copyLabel;
-        $("#target-label").textContent = `${machine.hostname} · ${agent}`;
+        $("#copy-command").disabled = !commandAvailable;
+        $("#target-label").textContent = `${machine.hostname} · ${agent || "no verified agent"}`;
         $("#machine-note").textContent = `${machine.fresh ? "Fresh registry heartbeat" : "Stale or unverified heartbeat"}${machine.current ? " · this machine" : " · remote machine"}`;
         $("#resume-mode").disabled = harness !== "bridge";
         $("#resume-notice").textContent = machine.current

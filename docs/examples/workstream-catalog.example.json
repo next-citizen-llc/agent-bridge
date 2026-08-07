@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "workstream-catalog/v1",
+  "title": "Example Workstream Control Center",
+  "githubOwner": "example-org",
+  "inventory": {
+    "capturedAt": "2026-08-07T00:00:00Z",
+    "portableProjects": 1,
+    "portableHistoricalCheckpoints": 1,
+    "macCodexThreads": 0,
+    "macClaudeSessions": 0,
+    "bridgeDispatches": {},
+    "limitations": [
+      "This public fixture contains no native session history or private work data."
+    ]
+  },
+  "workstreams": [
+    {
+      "id": "example-runtime",
+      "title": "Example runtime",
+      "summary": "A public fixture showing the portable workstream-catalog contract.",
+      "objectives": [
+        "Keep the runtime verifiable and resumable."
+      ],
+      "projectSlugs": [
+        "example-runtime"
+      ],
+      "repos": [
+        "example-runtime"
+      ],
+      "issueRefs": [
+        "example-runtime#12"
+      ],
+      "epicRefs": [
+        "https://github.com/example-org/example-runtime/issues/10"
+      ],
+      "evidence": "medium",
+      "tags": [
+        "fixture",
+        "runtime"
+      ]
+    }
+  ],
+  "method": {
+    "principles": [
+      "A resume action transfers verified state and explicit authority, not raw chat history."
+    ],
+    "sources": [
+      {
+        "title": "Agent Bridge workstream control center documentation",
+        "url": "https://github.com/next-citizen-llc/agent-bridge/blob/main/docs/workstream-control-center.md"
+      }
+    ]
+  }
+}

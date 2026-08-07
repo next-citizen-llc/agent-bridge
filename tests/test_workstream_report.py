@@ -75,6 +75,18 @@ class WorkstreamReportTests(unittest.TestCase):
             self.assertEqual("example", loaded["githubOwner"])
             self.assertEqual(2, len(loaded["workstreams"]))
 
+            malformed = json.loads(json.dumps(CATALOG_FIXTURE))
+            malformed["workstreams"][0]["objectives"] = "not-a-list"
+            path.write_text(json.dumps(malformed), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "objectives must be a list"):
+                load_workstream_catalog(path)
+
+    def test_documented_example_catalog_loads(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        loaded = load_workstream_catalog(root / "docs" / "examples" / "workstream-catalog.example.json")
+        self.assertEqual("workstream-catalog/v1", loaded["schemaVersion"])
+        self.assertEqual(["example-runtime#12"], loaded["workstreams"][0]["issueRefs"])
+
     def test_normalise_machines_merges_rows_and_capabilities(self) -> None:
         registry = {
             "harnesses": [
@@ -84,7 +96,7 @@ class WorkstreamReportTests(unittest.TestCase):
                     "platform": "macOS-15",
                     "updated_at": "2026-08-07T10:00:00Z",
                     "fresh": True,
-                    "client": "codex",
+                    "client": "registry-only-client",
                     "surface": "cli",
                     "capabilities": [
                         {"id": "codex", "label": "Codex", "command_found": True, "modes": ["review", "code"]},
@@ -110,7 +122,57 @@ class WorkstreamReportTests(unittest.TestCase):
         self.assertTrue(rows[0]["current"])
         self.assertEqual("macos", rows[0]["os"])
         self.assertEqual(["claude", "codex"], [row["id"] for row in rows[0]["agents"]])
+        self.assertNotIn("registry-only-client", [row["id"] for row in rows[0]["agents"]])
         self.assertEqual(["cli", "gui"], rows[0]["surfaces"])
+
+    def test_explicit_references_are_resolved_separately_from_repository_issues(self) -> None:
+        catalog = json.loads(json.dumps(CATALOG_FIXTURE))
+        catalog["workstreams"][0]["issueRefs"] = [
+            "sample-repo#2",
+            "missing-repo#99",
+            "not-a-reference",
+            "other-owner/sample-repo#2",
+        ]
+        catalog["workstreams"][0]["epicRefs"] = [
+            {"repo": "sample-repo", "number": 1},
+            "https://github.com/example/sample-repo/issues/1",
+            "sample-repo#2",
+        ]
+        github_data = {
+            "sample-repo": {
+                "issues": [
+                    {
+                        "repo": "sample-repo", "number": 1, "title": "Epic", "state": "open", "updatedAt": "2026-08-07T00:00:00Z", "type": "Epic",
+                        "isEpic": True, "labels": [], "milestone": None,
+                    },
+                    {
+                        "repo": "sample-repo", "number": 2, "title": "[Epic] Scoped issue", "state": "open", "updatedAt": "2026-08-07T01:00:00Z", "type": "Task",
+                        "isEpic": False, "labels": [], "milestone": None,
+                    },
+                ],
+                "error": "",
+            }
+        }
+        data = build_report_data(
+            catalog=catalog,
+            registry={"harnesses": []},
+            current_machine="local",
+            project_registry={},
+            conversations_root=None,
+            github_owner="example",
+            github_data=github_data,
+            generated_at="2026-08-07T00:00:00Z",
+        )
+        stream = data["workstreams"][0]
+        self.assertEqual([1, 2], sorted(issue["number"] for issue in stream["repositoryIssues"]))
+        self.assertEqual([2], [issue["number"] for issue in stream["relatedIssues"]])
+        self.assertEqual([1], [issue["number"] for issue in stream["relatedEpics"]])
+        self.assertEqual(4, len(stream["unresolvedRefs"]))
+        self.assertIn("resolved issue is not an Epic", {row["reason"] for row in stream["unresolvedRefs"]})
+        self.assertIn(
+            "owner must match catalog GitHub owner example", {row["reason"] for row in stream["unresolvedRefs"]}
+        )
+        self.assertEqual(stream["repositoryIssues"], stream["issues"])
 
     def test_project_registry_and_workspace_evidence_accept_mixed_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,11 +203,14 @@ class WorkstreamReportTests(unittest.TestCase):
             (conversations / "projects" / "sample").mkdir(parents=True)
             (conversations / "projects" / "sample" / "latest.md").write_text("checkpoint", encoding="utf-8")
             projects = load_project_registry(registry_path)
-            workspaces, checkpoints = workspace_evidence(["sample"], projects, conversations_root=conversations)
+            workspaces, checkpoints = workspace_evidence(
+                ["sample"], projects, conversations_root=conversations, current_machine="machine-a"
+            )
             self.assertEqual({"macos", "windows"}, {row["os"] for row in workspaces})
             self.assertEqual({"sample"}, {row["projectSlug"] for row in workspaces})
             self.assertIn("portable", {row["os"] for row in checkpoints})
             self.assertIn("windows", {row["os"] for row in checkpoints})
+            self.assertIn("machine-a", {row.get("machine") for row in checkpoints})
 
     def test_build_and_render_report_embeds_safe_self_contained_data(self) -> None:
         fake_github = {

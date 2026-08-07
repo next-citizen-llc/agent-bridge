@@ -52,6 +52,8 @@ async function launchBrowser(chromium) {
 async function validateViewport(browser, reportUrl, outputDir, name, viewport, AxeBuilder) {
   const context = await browser.newContext({ viewport });
   const page = await context.newPage();
+  page.setDefaultTimeout(10000);
+  page.setDefaultNavigationTimeout(10000);
   const consoleErrors = [];
   page.on("console", message => {
     if (message.type() === "error") consoleErrors.push(message.text());
@@ -73,20 +75,36 @@ async function validateViewport(browser, reportUrl, outputDir, name, viewport, A
   }
   const reportMeta = await page.evaluate(() => {
     const data = JSON.parse(document.getElementById("workstream-report-data").textContent);
-    return { count: data.workstreams.length, previewLimit: data.issuePreviewLimit, firstTitle: data.workstreams[0].title };
+    return {
+      count: data.workstreams.length,
+      previewLimit: data.issuePreviewLimit,
+      firstTitle: data.workstreams[0].title,
+      firstId: data.workstreams[0].id,
+      firstWorkspaces: data.workstreams[0].workspaces,
+      firstCheckpoints: data.workstreams[0].checkpoints,
+      issueCounts: data.workstreams.map(stream => ({ id: stream.id, count: stream.issues.length })),
+      machines: data.machines,
+    };
   });
   assert(await page.locator(".stream-card").count() === reportMeta.count, `${name}: expected ${reportMeta.count} workstream cards`);
 
-  const expandableCard = page.locator(".stream-card").filter({ has: page.locator(".issue-toggle") }).first();
-  assert(await expandableCard.count() === 1, `${name}: expected at least one workstream with more than ${reportMeta.previewLimit} issues`);
-  const initialIssues = await expandableCard.locator(".issue-row").count();
-  assert(initialIssues === reportMeta.previewLimit, `${name}: expected ${reportMeta.previewLimit} default issue rows, got ${initialIssues}`);
-  const issueToggle = expandableCard.locator(".issue-toggle");
-  await issueToggle.click();
-  const expandedIssues = await expandableCard.locator(".issue-row").count();
-  assert(expandedIssues > reportMeta.previewLimit, `${name}: issue expansion did not reveal additional rows`);
-  await expandableCard.locator(".issue-toggle").click();
-  assert(await expandableCard.locator(".issue-row").count() === reportMeta.previewLimit, `${name}: issue list did not collapse back to ${reportMeta.previewLimit} rows`);
+  const expandable = reportMeta.issueCounts.find(row => row.count > reportMeta.previewLimit);
+  let initialIssues = null;
+  let expandedIssues = null;
+  if (expandable) {
+    const expandableCard = page.locator(`.stream-card[data-stream-id="${expandable.id}"]`);
+    assert(await expandableCard.count() === 1, `${name}: expected the data-declared expandable workstream`);
+    initialIssues = await expandableCard.locator(".issue-row").count();
+    assert(initialIssues === reportMeta.previewLimit, `${name}: expected ${reportMeta.previewLimit} default issue rows, got ${initialIssues}`);
+    const issueToggle = expandableCard.locator(".issue-toggle");
+    await issueToggle.click();
+    expandedIssues = await expandableCard.locator(".issue-row").count();
+    assert(expandedIssues === expandable.count, `${name}: issue expansion showed ${expandedIssues} of ${expandable.count} rows`);
+    await expandableCard.locator(".issue-toggle").click();
+    assert(await expandableCard.locator(".issue-row").count() === reportMeta.previewLimit, `${name}: issue list did not collapse back to ${reportMeta.previewLimit} rows`);
+  } else {
+    assert(await page.locator(".issue-toggle").count() === 0, `${name}: report offered issue expansion without more than ${reportMeta.previewLimit} issues`);
+  }
 
   await page.locator(".resume-button").first().click();
   const dialog = page.locator("#resume-dialog");
@@ -104,27 +122,64 @@ async function validateViewport(browser, reportUrl, outputDir, name, viewport, A
   protectPrivateArtifact(dialogScreenshot);
 
   const machineOptions = await page.locator("#resume-machine option").count();
-  assert(machineOptions >= 2, `${name}: expected cross-machine choices`);
+  assert(machineOptions === Math.max(1, reportMeta.machines.length), `${name}: machine selector does not match report data`);
+  const selectedMachineId = await page.locator("#resume-machine").inputValue();
+  const selectedMachine = reportMeta.machines.find(machine => machine.id === selectedMachineId);
+  const selectedHasAgent = Boolean(selectedMachine && selectedMachine.agents && selectedMachine.agents.length);
   const command = await page.locator("#resume-command").textContent();
-  assert(command.includes("agent code bridge"), `${name}: resume command did not target Agent Bridge`);
-  assert(command.includes("--project-dir") || command.includes("Resolve the exact project"), `${name}: resume payload lacks project boundary`);
+  if (selectedHasAgent) {
+    assert(command.includes("agent code bridge"), `${name}: resume command did not target Agent Bridge`);
+    assert(command.includes("--project-dir") || command.includes("Resolve the exact project"), `${name}: resume payload lacks project boundary`);
+  } else {
+    assert(command.includes("No command generated"), `${name}: unverified machine produced an executable command`);
+    assert(await page.locator("#copy-command").isDisabled(), `${name}: unavailable command remained copyable`);
+  }
 
   const machineRows = await page.locator("#resume-machine option").evaluateAll(options => options.map(option => ({ value: option.value, text: option.textContent })));
-  const windowsMachine = machineRows.find(option => option.text.toLowerCase().includes("windows"));
+  const windowsRows = machineRows.filter(option => option.text.toLowerCase().includes("windows"));
+  const windowsMachine = windowsRows.find(option => {
+    const machine = reportMeta.machines.find(row => row.id === option.value);
+    if (!machine) return false;
+    return !reportMeta.firstWorkspaces.some(workspace =>
+      workspace.os === "windows" && workspace.machine && (workspace.machine === machine.hostname || workspace.machine === machine.id)
+    );
+  }) || windowsRows[0];
   if (windowsMachine) {
     await page.locator("#resume-machine").selectOption(windowsMachine.value);
     const agentValues = await page.locator("#resume-agent option").evaluateAll(options => options.map(option => option.value));
     if (agentValues.includes("grok")) await page.locator("#resume-agent").selectOption("grok");
+    await page.locator("#resume-focus").fill("Verify operator's handoff");
     const windowsCommand = await page.locator("#resume-command").textContent();
-    assert(windowsCommand.includes("agent code bridge"), `${name}: Windows selection lost the bridge command`);
-    assert(windowsCommand.includes("C:\\") || !windowsCommand.includes("--project-dir"), `${name}: Windows selection retained a non-Windows project path`);
+    const windowsWorkspace = await page.locator("#resume-workspace").inputValue();
+    const windowsMachineData = reportMeta.machines.find(machine => machine.id === windowsMachine.value) || { id: windowsMachine.value, hostname: "" };
+    const exactWindowsPaths = reportMeta.firstWorkspaces
+      .filter(workspace => workspace.os === "windows" && workspace.machine && (workspace.machine === windowsMachineData.hostname || workspace.machine === windowsMachineData.id))
+      .map(workspace => workspace.path);
+    assert(!windowsWorkspace || exactWindowsPaths.includes(windowsWorkspace), `${name}: Windows selection retained a workspace from another machine or OS`);
+    if (!exactWindowsPaths.length) assert(windowsWorkspace === "", `${name}: Windows machine without exact workspace evidence was auto-filled`);
+    const exactWindowsCheckpoints = reportMeta.firstCheckpoints.filter(checkpoint =>
+      checkpoint.machine && (checkpoint.machine === windowsMachineData.hostname || checkpoint.machine === windowsMachineData.id)
+    );
+    assert((await page.locator("#checkpoint-link").isHidden()) === (exactWindowsCheckpoints.length === 0), `${name}: checkpoint link visibility does not match exact-machine evidence`);
+    if (agentValues.some(Boolean)) {
+      assert(windowsCommand.startsWith("& agent code bridge"), `${name}: Windows command is not explicit PowerShell syntax`);
+      assert((await page.locator("#command-label").textContent()).includes("PowerShell"), `${name}: Windows command was not labeled as PowerShell`);
+      assert(windowsCommand.includes("operator''s handoff"), `${name}: PowerShell single-quote escaping is invalid`);
+    } else {
+      assert(windowsCommand.includes("No command generated"), `${name}: Windows machine without a verified agent produced a command`);
+    }
   }
   await page.locator("#resume-harness").selectOption("ledger");
-  assert((await page.locator("#resume-command").textContent()).includes("agent code tasks create"), `${name}: task-ledger selection did not produce a ledger command`);
+  const currentAgent = await page.locator("#resume-agent").inputValue();
+  if (currentAgent) {
+    assert((await page.locator("#resume-command").textContent()).includes("agent code tasks create"), `${name}: task-ledger selection did not produce a ledger command`);
+  } else {
+    assert((await page.locator("#resume-command").textContent()).includes("No command generated"), `${name}: task ledger produced a command without a verified agent`);
+  }
   await page.locator("#resume-harness").selectOption("native");
   const nativeBrief = await page.locator("#resume-command").textContent();
   assert(nativeBrief.includes("Resume workstream") && !nativeBrief.startsWith("agent code bridge"), `${name}: native selection did not produce a continuation brief`);
-  await page.locator("#resume-harness").selectOption("bridge");
+  if (currentAgent) await page.locator("#resume-harness").selectOption("bridge");
 
   await page.locator("#copy-command").click();
   await page.waitForTimeout(250);

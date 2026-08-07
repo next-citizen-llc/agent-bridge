@@ -1,0 +1,1288 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Cross-Harness Workstream Control Center</title>
+  <style>
+    :root {
+      --paper: #f4f1e8;
+      --paper-raised: #fffdf6;
+      --ink: #132523;
+      --muted: #63716c;
+      --line: #d7d9cf;
+      --line-strong: #aeb8b1;
+      --teal: #0f766e;
+      --teal-dark: #075c56;
+      --teal-soft: #dff4ed;
+      --coral: #e35d3f;
+      --coral-soft: #fbe8df;
+      --amber: #b36b00;
+      --amber-soft: #fff0c9;
+      --blue: #2e64a2;
+      --blue-soft: #e4eefb;
+      --shadow: 0 18px 60px rgba(15, 36, 33, .11);
+      --shadow-small: 0 8px 24px rgba(15, 36, 33, .08);
+      --radius-xl: 28px;
+      --radius-lg: 19px;
+      --radius-md: 12px;
+      --content: 1460px;
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 0%, rgba(15, 118, 110, .13), transparent 31rem),
+        radial-gradient(circle at 92% 12%, rgba(227, 93, 63, .10), transparent 28rem),
+        var(--paper);
+      min-height: 100vh;
+    }
+
+    button, input, select, textarea { font: inherit; }
+    button, select { cursor: pointer; }
+    a { color: inherit; }
+
+    :focus-visible {
+      outline: 3px solid color-mix(in srgb, var(--teal) 65%, white);
+      outline-offset: 3px;
+    }
+
+    .shell {
+      width: min(var(--content), calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 72px;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      color: #eefaf6;
+      background: #102c29;
+      border-radius: var(--radius-xl);
+      padding: clamp(28px, 5vw, 64px);
+      box-shadow: var(--shadow);
+      isolation: isolate;
+    }
+
+    .hero::before,
+    .hero::after {
+      content: "";
+      position: absolute;
+      border-radius: 999px;
+      pointer-events: none;
+      z-index: -1;
+    }
+
+    .hero::before {
+      width: 430px;
+      height: 430px;
+      right: -120px;
+      top: -190px;
+      background: rgba(31, 185, 168, .18);
+    }
+
+    .hero::after {
+      width: 340px;
+      height: 340px;
+      left: 42%;
+      bottom: -280px;
+      border: 1px solid rgba(255, 255, 255, .18);
+    }
+
+    .eyebrow {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin: 0 0 18px;
+      color: #a9ddd3;
+      font-size: .78rem;
+      font-weight: 800;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      content: "";
+      width: 26px;
+      height: 2px;
+      background: #f5a187;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(260px, .75fr);
+      gap: clamp(32px, 6vw, 84px);
+      align-items: end;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 900px;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(2.5rem, 6vw, 5.7rem);
+      font-weight: 500;
+      line-height: .98;
+      letter-spacing: -.045em;
+    }
+
+    .hero-copy {
+      max-width: 780px;
+      margin: 24px 0 0;
+      color: #c6ded8;
+      font-size: clamp(1rem, 1.8vw, 1.22rem);
+      line-height: 1.65;
+    }
+
+    .generated {
+      color: #9fc6bd;
+      font-size: .82rem;
+      line-height: 1.5;
+    }
+
+    .generated strong { color: white; }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .metric {
+      padding: 16px;
+      border: 1px solid rgba(255,255,255,.15);
+      background: rgba(255,255,255,.06);
+      border-radius: var(--radius-md);
+      backdrop-filter: blur(10px);
+    }
+
+    .metric b {
+      display: block;
+      font-size: 1.55rem;
+      line-height: 1;
+      color: white;
+    }
+
+    .metric span {
+      display: block;
+      margin-top: 7px;
+      color: #a9c7c0;
+      font-size: .76rem;
+      line-height: 1.3;
+    }
+
+    .boundary {
+      display: flex;
+      gap: 13px;
+      align-items: flex-start;
+      margin: 18px 0 0;
+      padding: 14px 16px;
+      color: #6b3d27;
+      background: var(--coral-soft);
+      border: 1px solid #edc7b6;
+      border-radius: var(--radius-md);
+      line-height: 1.5;
+      font-size: .88rem;
+    }
+
+    .boundary strong { white-space: nowrap; }
+
+    .toolbar {
+      position: sticky;
+      top: 10px;
+      z-index: 10;
+      display: grid;
+      grid-template-columns: minmax(240px, 1.5fr) repeat(2, minmax(150px, .5fr)) auto;
+      gap: 10px;
+      align-items: center;
+      margin: 18px 0;
+      padding: 12px;
+      background: color-mix(in srgb, var(--paper-raised) 91%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 17px;
+      box-shadow: var(--shadow-small);
+      backdrop-filter: blur(18px);
+    }
+
+    .field {
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+
+    .field svg {
+      position: absolute;
+      left: 13px;
+      width: 18px;
+      height: 18px;
+      color: var(--muted);
+      pointer-events: none;
+    }
+
+    .field input,
+    .field select,
+    .dialog-field input,
+    .dialog-field select,
+    .dialog-field textarea {
+      width: 100%;
+      color: var(--ink);
+      background: var(--paper-raised);
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      padding: 11px 12px;
+    }
+
+    .field input { padding-left: 40px; }
+
+    .field input::placeholder,
+    .dialog-field textarea::placeholder { color: #89938f; }
+
+    .toolbar-actions { display: flex; gap: 7px; }
+
+    .button {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      padding: 10px 14px;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      color: var(--ink);
+      background: var(--paper-raised);
+      font-weight: 760;
+      line-height: 1;
+      text-decoration: none;
+    }
+
+    .button:hover { border-color: var(--teal); color: var(--teal-dark); }
+    .button.primary { color: white; background: var(--teal); border-color: var(--teal); }
+    .button.primary:hover { color: white; background: var(--teal-dark); }
+    .button.ghost { background: transparent; }
+    .button.compact { min-height: 36px; padding: 8px 11px; font-size: .82rem; }
+    .button:disabled { cursor: not-allowed; opacity: .5; }
+
+    .section-intro {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      align-items: end;
+      margin: 38px 2px 16px;
+    }
+
+    .section-intro h2 {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(1.8rem, 3vw, 2.55rem);
+      font-weight: 500;
+      letter-spacing: -.025em;
+    }
+
+    .section-intro p { margin: 6px 0 0; color: var(--muted); }
+
+    .result-count {
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-size: .85rem;
+    }
+
+    .stream-grid {
+      display: grid;
+      gap: 14px;
+    }
+
+    .stream-card {
+      background: var(--paper-raised);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      box-shadow: 0 2px 0 rgba(17, 61, 55, .03);
+      overflow: clip;
+      transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+    }
+
+    .stream-card:hover {
+      border-color: #bacbc4;
+      box-shadow: var(--shadow-small);
+      transform: translateY(-1px);
+    }
+
+    .card-header {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+      padding: 18px 18px 17px;
+    }
+
+    .stream-index {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      color: var(--teal-dark);
+      background: var(--teal-soft);
+      border-radius: 12px;
+      font-weight: 900;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stream-title-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .stream-title-row h3 {
+      margin: 0;
+      font-size: 1.08rem;
+      letter-spacing: -.01em;
+    }
+
+    .stream-summary {
+      margin: 6px 0 0;
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: .91rem;
+    }
+
+    .card-actions { display: flex; gap: 8px; align-items: center; }
+
+    .toggle-button {
+      display: grid;
+      place-items: center;
+      width: 40px;
+      height: 40px;
+      padding: 0;
+      color: var(--muted);
+      background: transparent;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+
+    .toggle-button svg { width: 18px; height: 18px; transition: transform .18s ease; }
+    .toggle-button[aria-expanded="true"] svg { transform: rotate(180deg); }
+
+    .card-body {
+      display: grid;
+      grid-template-columns: minmax(230px, .75fr) minmax(0, 1.45fr);
+      gap: 24px;
+      padding: 0 18px 20px 74px;
+      border-top: 1px solid transparent;
+    }
+
+    .card-body[hidden] { display: none; }
+
+    .card-body::before {
+      content: "";
+      grid-column: 1 / -1;
+      height: 1px;
+      background: var(--line);
+      margin-bottom: -6px;
+    }
+
+    .subhead {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: .72rem;
+      font-weight: 850;
+      letter-spacing: .10em;
+      text-transform: uppercase;
+    }
+
+    .objective-list {
+      display: grid;
+      gap: 9px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .objective-list li {
+      position: relative;
+      padding-left: 18px;
+      color: #344440;
+      font-size: .88rem;
+      line-height: 1.47;
+    }
+
+    .objective-list li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: .55em;
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: var(--coral);
+    }
+
+    .meta-stack { display: grid; gap: 18px; margin-top: 22px; }
+
+    .chip-row { display: flex; flex-wrap: wrap; gap: 7px; }
+
+    .chip,
+    .state-pill {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      min-height: 26px;
+      padding: 5px 9px;
+      border-radius: 999px;
+      font-size: .72rem;
+      font-weight: 780;
+      line-height: 1;
+      text-decoration: none;
+    }
+
+    .chip {
+      color: #40504b;
+      background: #eef0e9;
+      border: 1px solid #dde0d8;
+    }
+
+    a.chip:hover { color: var(--teal-dark); border-color: #8db9ac; }
+    .evidence-high { color: #0d5b50; background: var(--teal-soft); }
+    .evidence-medium { color: #76500a; background: var(--amber-soft); }
+    .evidence-low { color: #88432e; background: var(--coral-soft); }
+
+    .issue-panel {
+      min-width: 0;
+      padding: 15px;
+      background: #f8f7f1;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+    }
+
+    .issue-panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .issue-panel-head .subhead { margin: 0; }
+
+    .issue-counts {
+      display: flex;
+      gap: 5px;
+      color: var(--muted);
+      font-size: .75rem;
+    }
+
+    .epic-strip {
+      display: flex;
+      gap: 7px;
+      overflow-x: auto;
+      padding: 2px 0 11px;
+      scrollbar-width: thin;
+    }
+
+    .epic-link {
+      flex: 0 0 auto;
+      display: inline-flex;
+      gap: 7px;
+      align-items: center;
+      max-width: 280px;
+      padding: 8px 10px;
+      color: #244873;
+      background: var(--blue-soft);
+      border: 1px solid #c1d7ef;
+      border-radius: 9px;
+      font-size: .75rem;
+      font-weight: 780;
+      text-decoration: none;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .issue-list {
+      display: grid;
+      gap: 1px;
+      margin: 0;
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--line);
+      overflow: hidden;
+      list-style: none;
+    }
+
+    .issue-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 9px;
+      align-items: center;
+      min-height: 42px;
+      padding: 8px 10px;
+      color: #33423e;
+      background: var(--paper-raised);
+    }
+
+    .issue-row:hover { background: #f4faf7; }
+
+    .state-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: #8e9a96;
+      box-shadow: 0 0 0 3px #eef0ed;
+    }
+
+    .state-dot.open { background: #21a16e; box-shadow: 0 0 0 3px #dff3e8; }
+
+    .issue-link {
+      min-width: 0;
+      color: inherit;
+      font-size: .82rem;
+      font-weight: 680;
+      line-height: 1.35;
+      text-decoration: none;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .issue-link:hover { color: var(--teal-dark); text-decoration: underline; }
+    .issue-meta { color: var(--muted); font-size: .7rem; white-space: nowrap; }
+
+    .empty-state {
+      padding: 18px;
+      color: var(--muted);
+      background: var(--paper-raised);
+      border: 1px dashed var(--line-strong);
+      border-radius: 11px;
+      font-size: .82rem;
+      line-height: 1.5;
+    }
+
+    .issue-footer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 10px;
+    }
+
+    .repo-error {
+      color: #8d4f31;
+      font-size: .72rem;
+      line-height: 1.4;
+    }
+
+    .method-card {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, .7fr);
+      gap: 28px;
+      margin-top: 34px;
+      padding: clamp(22px, 4vw, 40px);
+      background: #e7ede7;
+      border: 1px solid #cad4cc;
+      border-radius: var(--radius-xl);
+    }
+
+    .method-card h2 {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 2rem;
+      font-weight: 500;
+    }
+
+    .method-card .subhead { color: #45554f; }
+
+    .method-card ul { margin: 18px 0 0; padding-left: 19px; }
+    .method-card li { margin: 8px 0; color: #3f504a; line-height: 1.5; }
+    .source-list { display: grid; gap: 8px; align-content: start; }
+    .source-list a {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 11px 12px;
+      color: #2c433e;
+      background: rgba(255,255,255,.52);
+      border: 1px solid #c8d2ca;
+      border-radius: 10px;
+      font-size: .83rem;
+      font-weight: 720;
+      text-decoration: none;
+    }
+
+    .source-list a:hover { color: var(--teal-dark); border-color: #91b5aa; }
+
+    dialog {
+      position: fixed;
+      inset: 50% auto auto 50%;
+      transform: translate(-50%, -50%);
+      width: min(760px, calc(100vw - 24px));
+      max-width: calc(100vw - 24px);
+      max-height: min(90dvh, 920px);
+      margin: 0;
+      padding: 0;
+      color: var(--ink);
+      background: var(--paper-raised);
+      border: 1px solid var(--line-strong);
+      border-radius: 22px;
+      box-shadow: 0 32px 100px rgba(5, 28, 25, .34);
+      overflow: auto;
+    }
+
+    dialog::backdrop { background: rgba(8, 29, 27, .58); backdrop-filter: blur(5px); }
+
+    .dialog-head {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      align-items: flex-start;
+      padding: 21px 22px 16px;
+      background: color-mix(in srgb, var(--paper-raised) 94%, transparent);
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(14px);
+    }
+
+    .dialog-head h2 { margin: 0; font-family: Georgia, "Times New Roman", serif; font-weight: 500; font-size: 1.65rem; }
+    .dialog-head p { margin: 5px 0 0; color: var(--muted); font-size: .84rem; line-height: 1.45; }
+
+    .icon-button {
+      display: grid;
+      place-items: center;
+      flex: 0 0 auto;
+      width: 38px;
+      height: 38px;
+      padding: 0;
+      color: var(--muted);
+      background: transparent;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+
+    .dialog-body { padding: 20px 22px 24px; }
+
+    .dialog-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .dialog-field { display: grid; gap: 7px; align-content: start; }
+    .dialog-field.wide { grid-column: 1 / -1; }
+    .dialog-field label { color: #4a5a55; font-size: .77rem; font-weight: 800; }
+    .dialog-field textarea { min-height: 82px; resize: vertical; line-height: 1.45; }
+    .field-note { color: var(--muted); font-size: .72rem; line-height: 1.4; }
+
+    .command-wrap { margin-top: 17px; }
+
+    .command-label {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 7px;
+      color: #4a5a55;
+      font-size: .77rem;
+      font-weight: 800;
+    }
+
+    pre {
+      min-height: 98px;
+      max-height: 240px;
+      margin: 0;
+      padding: 15px;
+      color: #dff8ef;
+      background: #102c29;
+      border: 1px solid #234a45;
+      border-radius: 12px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 500 .78rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .resume-notice {
+      margin-top: 12px;
+      padding: 11px 12px;
+      color: #6c4720;
+      background: var(--amber-soft);
+      border: 1px solid #e6cf95;
+      border-radius: 10px;
+      font-size: .78rem;
+      line-height: 1.45;
+    }
+
+    .dialog-actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 9px;
+      margin-top: 17px;
+    }
+
+    .toast {
+      position: fixed;
+      z-index: 1000;
+      left: max(12px, env(safe-area-inset-left));
+      bottom: max(12px, env(safe-area-inset-bottom));
+      width: min(420px, calc(100vw - 24px));
+      max-width: calc(100vw - 24px);
+      padding: 13px 15px;
+      color: white;
+      background: #143b36;
+      border: 1px solid #2b5a53;
+      border-radius: 11px;
+      box-shadow: var(--shadow);
+      font-size: .83rem;
+      line-height: 1.4;
+      transform: translateY(20px);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .18s ease, transform .18s ease;
+    }
+
+    .toast.visible { transform: translateY(0); opacity: 1; }
+
+    @media (max-width: 940px) {
+      .hero-grid, .method-card { grid-template-columns: 1fr; }
+      .toolbar { grid-template-columns: 1fr 1fr; }
+      .field.search { grid-column: 1 / -1; }
+      .toolbar-actions { justify-content: flex-end; }
+      .card-body { grid-template-columns: 1fr; padding-left: 18px; }
+    }
+
+    @media (max-width: 650px) {
+      .shell { width: min(100% - 18px, var(--content)); padding-top: 9px; }
+      .hero { border-radius: 20px; padding: 25px 20px; }
+      h1 { font-size: clamp(2.3rem, 14vw, 4rem); }
+      .metric-grid { grid-template-columns: repeat(2, 1fr); }
+      .toolbar { position: static; grid-template-columns: 1fr; }
+      .field.search { grid-column: auto; }
+      .toolbar-actions { justify-content: stretch; }
+      .toolbar-actions .button { flex: 1; }
+      .section-intro { align-items: flex-start; flex-direction: column; gap: 8px; }
+      .card-header { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
+      .stream-index { width: 36px; height: 36px; }
+      .card-actions { grid-column: 1 / -1; padding-left: 50px; }
+      .card-actions .button.primary { flex: 1; }
+      .card-body { padding: 0 13px 15px; }
+      .issue-row { grid-template-columns: auto minmax(0, 1fr); }
+      .issue-meta { grid-column: 2; }
+      .dialog-grid { grid-template-columns: 1fr; }
+      .dialog-field.wide { grid-column: auto; }
+      .dialog-head { padding: 17px 17px 13px; }
+      .dialog-body { padding: 16px 17px 20px; }
+      dialog { width: calc(100vw - 16px); max-width: calc(100vw - 16px); max-height: calc(100dvh - 16px); border-radius: 17px; }
+      .dialog-actions .button { flex: 1 1 140px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+    }
+
+    @media print {
+      body { background: white; }
+      .shell { width: 100%; padding: 0; }
+      .hero { color: black; background: white; box-shadow: none; border: 1px solid #aaa; }
+      .hero-copy, .generated { color: #333; }
+      .toolbar, .button, .toggle-button, dialog, .toast { display: none !important; }
+      .card-body[hidden] { display: grid; }
+      .stream-card { break-inside: avoid; box-shadow: none; }
+      .issue-list .issue-row { display: grid !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <p class="eyebrow">Portable work identity · live routing metadata</p>
+      <div class="hero-grid">
+        <div>
+          <h1>Workstream<br>control center</h1>
+          <p class="hero-copy">One evidence-backed view across Codex, Claude, Grok, macOS, Windows, portable checkpoints, repositories, epics, and issues.</p>
+        </div>
+        <div>
+          <div class="generated" id="generated-meta"></div>
+          <div class="metric-grid" id="hero-metrics"></div>
+        </div>
+      </div>
+    </header>
+
+    <aside class="boundary" role="note">
+      <strong>Resume boundary</strong>
+      <span id="resume-boundary"></span>
+    </aside>
+
+    <nav class="toolbar" aria-label="Workstream filters">
+      <div class="field search">
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+        <input id="search" type="search" autocomplete="off" placeholder="Search workstreams, issues, repositories…" aria-label="Search workstreams">
+      </div>
+      <div class="field">
+        <select id="evidence-filter" aria-label="Filter by evidence level">
+          <option value="all">All evidence levels</option>
+          <option value="high">High evidence</option>
+          <option value="medium">Medium evidence</option>
+          <option value="low">Low evidence</option>
+        </select>
+      </div>
+      <div class="field">
+        <select id="issue-filter" aria-label="Filter by GitHub issue state">
+          <option value="all">All GitHub states</option>
+          <option value="open">Has open issues</option>
+          <option value="linked">Has linked issues</option>
+          <option value="unlinked">No linked issues</option>
+        </select>
+      </div>
+      <div class="toolbar-actions">
+        <button class="button ghost compact" id="collapse-all" type="button">Collapse all</button>
+        <button class="button ghost compact" id="expand-all" type="button">Expand all</button>
+      </div>
+    </nav>
+
+    <section aria-labelledby="workstreams-heading">
+      <div class="section-intro">
+        <div>
+          <h2 id="workstreams-heading">Objective-level workstreams</h2>
+          <p>Repeated sessions and checkpoints are grouped by durable objective, not model identity.</p>
+        </div>
+        <div class="result-count" id="result-count" aria-live="polite"></div>
+      </div>
+      <div class="stream-grid" id="workstream-grid"></div>
+    </section>
+
+    <section class="method-card" aria-labelledby="method-heading">
+      <div>
+        <p class="eyebrow" style="color: var(--teal-dark)">Tracking architecture</p>
+        <h2 id="method-heading">Work is the identity. Harnesses are routes.</h2>
+        <ul id="method-principles"></ul>
+      </div>
+      <div>
+        <p class="subhead">Guidance sources</p>
+        <div class="source-list" id="source-list"></div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="resume-dialog" aria-labelledby="resume-title">
+    <div class="dialog-head">
+      <div>
+        <h2 id="resume-title">Resume workstream</h2>
+        <p id="resume-subtitle"></p>
+      </div>
+      <button class="icon-button" id="close-dialog" type="button" aria-label="Close resume dialog">✕</button>
+    </div>
+    <div class="dialog-body">
+      <div class="dialog-grid">
+        <div class="dialog-field">
+          <label for="resume-machine">Machine</label>
+          <select id="resume-machine"></select>
+          <span class="field-note" id="machine-note"></span>
+        </div>
+        <div class="dialog-field">
+          <label for="resume-agent">Agent</label>
+          <select id="resume-agent"></select>
+          <span class="field-note">Availability comes from the selected machine's latest capability cards.</span>
+        </div>
+        <div class="dialog-field">
+          <label for="resume-harness">Execution surface</label>
+          <select id="resume-harness">
+            <option value="bridge">Agent Bridge headless</option>
+            <option value="ledger">Durable task ledger</option>
+            <option value="native">Native CLI / GUI handoff</option>
+          </select>
+          <span class="field-note" id="harness-note"></span>
+        </div>
+        <div class="dialog-field">
+          <label for="resume-mode">Mode</label>
+          <select id="resume-mode">
+            <option value="code">Code / implementation</option>
+            <option value="review">Read-only review</option>
+          </select>
+        </div>
+        <div class="dialog-field wide">
+          <label for="resume-workspace">Project or worktree path on selected machine</label>
+          <input id="resume-workspace" type="text" spellcheck="false" autocomplete="off">
+          <span class="field-note">Pre-filled only from portable project evidence. Review it before running the command.</span>
+        </div>
+        <div class="dialog-field wide">
+          <label for="resume-focus">Optional focus for this continuation</label>
+          <textarea id="resume-focus" placeholder="For example: reconcile current PR state, then take the next unfinished issue through tests and review."></textarea>
+        </div>
+      </div>
+
+      <div class="command-wrap">
+        <div class="command-label"><span id="command-label">Command to run</span><span id="target-label"></span></div>
+        <pre id="resume-command" tabindex="0"></pre>
+      </div>
+      <div class="resume-notice" id="resume-notice"></div>
+      <div class="dialog-actions">
+        <a class="button ghost" id="checkpoint-link" href="#" target="_blank" rel="noreferrer">Open checkpoint</a>
+        <button class="button" id="copy-brief" type="button">Copy continuation brief</button>
+        <button class="button primary" id="copy-command" type="button">Copy resume command</button>
+      </div>
+    </div>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script id="workstream-report-data" type="application/json">__WORKSTREAM_REPORT_DATA__</script>
+  <script>
+    (() => {
+      "use strict";
+
+      const report = JSON.parse(document.getElementById("workstream-report-data").textContent);
+      const previewLimit = Number(report.issuePreviewLimit || 5);
+      const openStreams = new Set(report.workstreams.map(stream => stream.id));
+      const expandedIssues = new Set();
+      let activeStream = null;
+      let toastTimer = null;
+
+      const $ = selector => document.querySelector(selector);
+      const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
+      })[char]);
+
+      const safeWebUrl = value => {
+        try {
+          const url = new URL(String(value));
+          return url.protocol === "https:" ? url.href : "#";
+        } catch (_) { return "#"; }
+      };
+
+      const fileUrl = path => {
+        const value = String(path || "");
+        if (!value) return "#";
+        if (/^[A-Za-z]:\\/.test(value)) {
+          return "file:///" + value.replace(/\\/g, "/").split("/").map(encodeURIComponent).join("/").replace(/^([A-Za-z])%3A/, "$1:");
+        }
+        if (value.startsWith("/")) return "file://" + value.split("/").map((part, index) => index === 0 ? "" : encodeURIComponent(part)).join("/");
+        return "#";
+      };
+
+      const formatDate = value => {
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? String(value || "Unknown") : date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+      };
+
+      const shellQuote = (value, os) => {
+        const text = String(value ?? "");
+        if (os === "windows") return "'" + text.replace(/'/g, "''") + "'";
+        return "'" + text.replace(/'/g, "'\"'\"'") + "'";
+      };
+
+      function showToast(message) {
+        const toast = $("#toast");
+        toast.textContent = message;
+        toast.classList.add("visible");
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toast.classList.remove("visible"), 2600);
+      }
+
+      async function copyText(text, label) {
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch (_) {
+          const area = document.createElement("textarea");
+          area.value = text;
+          area.style.position = "fixed";
+          area.style.opacity = "0";
+          document.body.appendChild(area);
+          area.select();
+          document.execCommand("copy");
+          area.remove();
+        }
+        showToast(label);
+      }
+
+      function renderHero() {
+        const inventory = report.inventory;
+        const dispatches = Object.values(inventory.bridgeDispatches || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+        $("#generated-meta").innerHTML = `<strong>Generated ${esc(formatDate(report.generatedAt))}</strong><br>Inventory snapshot ${esc(formatDate(inventory.capturedAt))}`;
+        $("#hero-metrics").innerHTML = [
+          [report.workstreams.length, "objective-level workstreams"],
+          [inventory.portableHistoricalCheckpoints, "portable checkpoints"],
+          [inventory.macCodexThreads + inventory.macClaudeSessions, "indexed Mac sessions"],
+          [dispatches, "Agent Bridge dispatches"],
+        ].map(([value, label]) => `<div class="metric"><b>${esc(value)}</b><span>${esc(label)}</span></div>`).join("");
+        $("#resume-boundary").textContent = report.resumeBoundary;
+      }
+
+      function issueMatchesFilter(stream, value) {
+        if (value === "open") return stream.counts.openIssues > 0;
+        if (value === "linked") return stream.counts.issues > 0;
+        if (value === "unlinked") return stream.counts.issues === 0;
+        return true;
+      }
+
+      function filteredStreams() {
+        const query = $("#search").value.trim().toLowerCase();
+        const evidence = $("#evidence-filter").value;
+        const issueState = $("#issue-filter").value;
+        return report.workstreams.filter(stream => {
+          if (evidence !== "all" && stream.evidence !== evidence) return false;
+          if (!issueMatchesFilter(stream, issueState)) return false;
+          if (!query) return true;
+          const haystack = [
+            stream.title, stream.summary, ...(stream.tags || []), ...(stream.projectSlugs || []),
+            ...(stream.repositories || []).map(repo => repo.name),
+            ...(stream.issues || []).map(issue => `${issue.repo} ${issue.number} ${issue.title}`),
+          ].join(" ").toLowerCase();
+          return haystack.includes(query);
+        });
+      }
+
+      function issueRows(stream) {
+        const expanded = expandedIssues.has(stream.id);
+        const visible = expanded ? stream.issues : stream.issues.slice(0, previewLimit);
+        if (!visible.length) {
+          const repoLinks = stream.repositories.map(repo => `<a class="chip" href="${esc(safeWebUrl(repo.issuesUrl))}" target="_blank" rel="noreferrer">${esc(repo.name)} issues</a>`).join("");
+          return `<div class="empty-state">No GitHub issues were returned for the mapped repositories.${repoLinks ? `<div class="chip-row" style="margin-top:10px">${repoLinks}</div>` : " This workstream has no mapped GitHub repository."}</div>`;
+        }
+        return `<ul class="issue-list">${visible.map(issue => `
+          <li class="issue-row">
+            <span class="state-dot ${issue.state === "open" ? "open" : ""}" aria-hidden="true"></span>
+            <a class="issue-link" href="${esc(safeWebUrl(issue.url))}" target="_blank" rel="noreferrer" title="${esc(issue.title)}">${esc(issue.repo)}#${esc(issue.number)} · ${esc(issue.title)}</a>
+            <span class="issue-meta">${esc(issue.type || issue.state)}</span>
+          </li>`).join("")}</ul>`;
+      }
+
+      function epicRows(stream) {
+        const rows = [
+          ...stream.epics.map(issue => ({ title: `${issue.repo}#${issue.number} · ${issue.title}`, url: issue.url, kind: "Epic" })),
+          ...stream.milestones.map(item => ({ title: `${item.repo} · ${item.title}`, url: item.url, kind: "Milestone" })),
+        ];
+        if (!rows.length) return "";
+        return `<div class="epic-strip" aria-label="Epics and milestones">${rows.map(row => `<a class="epic-link" href="${esc(safeWebUrl(row.url))}" target="_blank" rel="noreferrer"><span>${esc(row.kind)}</span><span>${esc(row.title)}</span></a>`).join("")}</div>`;
+      }
+
+      function streamCard(stream, index) {
+        const isOpen = openStreams.has(stream.id);
+        const remaining = Math.max(0, stream.issues.length - previewLimit);
+        const issuesExpanded = expandedIssues.has(stream.id);
+        const repos = stream.repositories.map(repo => `<a class="chip" href="${esc(safeWebUrl(repo.url))}" target="_blank" rel="noreferrer">${esc(repo.name)}</a>`).join("");
+        const repoErrors = stream.repositories.filter(repo => repo.error).map(repo => `${repo.name}: ${repo.error}`).join(" · ");
+        const checkpoint = stream.checkpoints.find(item => item.os === "portable") || stream.checkpoints[0];
+        return `
+          <article class="stream-card" data-stream-id="${esc(stream.id)}">
+            <div class="card-header">
+              <div class="stream-index">${String(index + 1).padStart(2, "0")}</div>
+              <div>
+                <div class="stream-title-row">
+                  <h3>${esc(stream.title)}</h3>
+                  <span class="state-pill evidence-${esc(stream.evidence)}">${esc(stream.evidence)} evidence</span>
+                  ${stream.counts.openIssues ? `<span class="chip">${esc(stream.counts.openIssues)} open issue${stream.counts.openIssues === 1 ? "" : "s"}</span>` : ""}
+                </div>
+                <p class="stream-summary">${esc(stream.summary)}</p>
+              </div>
+              <div class="card-actions">
+                <button class="button primary compact resume-button" type="button" data-stream="${esc(stream.id)}">Resume</button>
+                ${checkpoint ? `<a class="button compact" href="${esc(fileUrl(checkpoint.path))}" target="_blank" rel="noreferrer">Checkpoint</a>` : ""}
+                <button class="toggle-button" type="button" data-toggle-stream="${esc(stream.id)}" aria-expanded="${isOpen}" aria-controls="body-${esc(stream.id)}" aria-label="${isOpen ? "Collapse" : "Expand"} ${esc(stream.title)}">
+                  <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+                </button>
+              </div>
+            </div>
+            <div class="card-body" id="body-${esc(stream.id)}" ${isOpen ? "" : "hidden"}>
+              <div>
+                <p class="subhead">Durable objectives</p>
+                <ul class="objective-list">${stream.objectives.map(item => `<li>${esc(item)}</li>`).join("")}</ul>
+                <div class="meta-stack">
+                  <div><p class="subhead">Repositories</p><div class="chip-row">${repos || `<span class="chip">No mapped repository</span>`}</div></div>
+                  <div><p class="subhead">Project checkpoints</p><div class="chip-row">${stream.projectSlugs.map(slug => `<span class="chip">${esc(slug)}</span>`).join("")}</div></div>
+                </div>
+              </div>
+              <div class="issue-panel">
+                <div class="issue-panel-head">
+                  <p class="subhead">Related GitHub work</p>
+                  <div class="issue-counts"><span>${esc(stream.counts.openIssues)} open</span><span>·</span><span>${esc(stream.counts.closedIssues)} closed</span></div>
+                </div>
+                ${epicRows(stream)}
+                ${issueRows(stream)}
+                <div class="issue-footer">
+                  ${remaining > 0 ? `<button class="button ghost compact issue-toggle" type="button" data-stream="${esc(stream.id)}" aria-expanded="${issuesExpanded}">${issuesExpanded ? `Show first ${previewLimit}` : `Show ${remaining} more`}</button>` : `<span></span>`}
+                  <div class="chip-row">${stream.repositories.map(repo => `<a class="chip" href="${esc(safeWebUrl(repo.issuesUrl))}" target="_blank" rel="noreferrer">All ${esc(repo.name)} issues</a>`).join("")}</div>
+                </div>
+                ${repoErrors ? `<p class="repo-error">Refresh warnings: ${esc(repoErrors)}</p>` : ""}
+              </div>
+            </div>
+          </article>`;
+      }
+
+      function renderStreams() {
+        const streams = filteredStreams();
+        $("#result-count").textContent = `${streams.length} of ${report.workstreams.length} workstreams`;
+        $("#workstream-grid").innerHTML = streams.length
+          ? streams.map((stream, index) => streamCard(stream, index)).join("")
+          : `<div class="empty-state">No workstreams match the current filters.</div>`;
+      }
+
+      function machineOptions() {
+        const machines = report.machines.length ? report.machines : [{
+          id: "local", displayName: "This machine · unregistered", os: navigator.platform.toLowerCase().includes("win") ? "windows" : "macos", fresh: false, current: true,
+          agents: [{id:"codex",label:"Codex"},{id:"claude",label:"Claude Code"},{id:"grok",label:"Grok Build"}]
+        }];
+        return machines;
+      }
+
+      function selectedMachine() {
+        return machineOptions().find(machine => machine.id === $("#resume-machine").value) || machineOptions()[0];
+      }
+
+      function selectedWorkspace(stream, machine) {
+        const primary = stream.projectSlugs[0];
+        const exactMachine = item => item.machine && (item.machine === machine.hostname || item.machine === machine.id);
+        return stream.workspaces.find(item => item.projectSlug === primary && item.os === machine.os && exactMachine(item))
+          || stream.workspaces.find(item => item.projectSlug === primary && item.os === machine.os)
+          || stream.workspaces.find(item => item.os === machine.os && exactMachine(item))
+          || stream.workspaces.find(item => item.os === machine.os)
+          || stream.workspaces.find(item => item.projectSlug === primary)
+          || stream.workspaces[0]
+          || null;
+      }
+
+      function selectedCheckpoint(stream, machine) {
+        return stream.checkpoints.find(item => item.os === "portable") || stream.checkpoints.find(item => item.os === machine.os) || stream.checkpoints[0] || null;
+      }
+
+      function populateAgents(machine, preferred) {
+        const agents = machine.agents && machine.agents.length ? machine.agents : [{id:"codex",label:"Codex"},{id:"claude",label:"Claude Code"},{id:"grok",label:"Grok Build"}];
+        $("#resume-agent").innerHTML = agents.map(agent => `<option value="${esc(agent.id)}">${esc(agent.label)}</option>`).join("");
+        if (preferred && agents.some(agent => agent.id === preferred)) $("#resume-agent").value = preferred;
+      }
+
+      function continuationBrief() {
+        if (!activeStream) return "";
+        const machine = selectedMachine();
+        const agent = $("#resume-agent").value;
+        const workspace = $("#resume-workspace").value.trim();
+        const checkpoint = selectedCheckpoint(activeStream, machine);
+        const focus = $("#resume-focus").value.trim();
+        return [
+          `Resume workstream ${activeStream.id}: ${activeStream.title}.`,
+          checkpoint ? `Read the portable checkpoint at ${checkpoint.path}.` : "No portable checkpoint path was verified; reconcile project evidence before changing state.",
+          workspace ? `Work only in the verified project/worktree: ${workspace}.` : "Resolve the exact project/worktree before changing files.",
+          `Target agent: ${agent}. Target machine: ${machine.displayName}.`,
+          "Re-verify Git, GitHub, artifact, and external state before trusting checkpoint status. Preserve native session history. Do not duplicate completed work.",
+          "Take the next genuinely incomplete objective through focused verification; keep outbound messages draft-only unless explicitly authorized.",
+          focus ? `Operator focus: ${focus}` : "",
+        ].filter(Boolean).join(" ");
+      }
+
+      function refreshResumeCommand({ preserveWorkspace = true } = {}) {
+        if (!activeStream) return;
+        const machine = selectedMachine();
+        const harness = $("#resume-harness").value;
+        const agent = $("#resume-agent").value;
+        const mode = $("#resume-mode").value;
+        if (!preserveWorkspace) {
+          const workspace = selectedWorkspace(activeStream, machine);
+          $("#resume-workspace").value = workspace ? workspace.path : "";
+        }
+        const workspace = $("#resume-workspace").value.trim();
+        const brief = continuationBrief();
+        let output = "";
+        let label = "Command to run";
+        let copyLabel = "Copy resume command";
+        if (harness === "bridge") {
+          const parts = ["agent code bridge", "--from human", `--to ${shellQuote(agent, machine.os)}`, `--mode ${mode}`];
+          if (workspace) parts.push(`--project-dir ${shellQuote(workspace, machine.os)}`);
+          parts.push(`--prompt ${shellQuote(brief, machine.os)}`);
+          output = parts.join(" ");
+          $("#harness-note").textContent = "Runs one bounded headless turn when executed on the selected machine.";
+        } else if (harness === "ledger") {
+          output = `agent code tasks create --title ${shellQuote(`${activeStream.id}: ${activeStream.title}`, machine.os)} --run-id ${shellQuote(`workstream-${activeStream.id}`, machine.os)} --owner ${shellQuote(`${machine.id}/${agent}`, machine.os)}`;
+          label = "Durable ledger command";
+          copyLabel = "Copy ledger command";
+          $("#harness-note").textContent = "Records a durable task. It does not itself launch an agent or native chat.";
+        } else {
+          output = brief;
+          label = "Continuation brief";
+          copyLabel = "Copy continuation brief";
+          $("#harness-note").textContent = "Paste the brief into the selected native CLI or GUI. Agent Bridge cannot inject into an existing chat.";
+        }
+        $("#resume-command").textContent = output;
+        $("#command-label").textContent = label;
+        $("#copy-command").textContent = copyLabel;
+        $("#target-label").textContent = `${machine.hostname} · ${agent}`;
+        $("#machine-note").textContent = `${machine.fresh ? "Fresh registry heartbeat" : "Stale or unverified heartbeat"}${machine.current ? " · this machine" : " · remote machine"}`;
+        $("#resume-mode").disabled = harness !== "bridge";
+        $("#resume-notice").textContent = machine.current
+          ? "Review the generated path and prompt before running. Clicking Copy does not execute the command."
+          : `Run this on ${machine.hostname}. This local report does not execute commands on a remote machine or prove that its agent is authenticated.`;
+        const checkpoint = selectedCheckpoint(activeStream, machine);
+        const checkpointLink = $("#checkpoint-link");
+        checkpointLink.href = checkpoint ? fileUrl(checkpoint.path) : "#";
+        checkpointLink.hidden = !checkpoint;
+      }
+
+      function openResume(streamId) {
+        activeStream = report.workstreams.find(stream => stream.id === streamId);
+        if (!activeStream) return;
+        $("#resume-title").textContent = `Resume · ${activeStream.title}`;
+        $("#resume-subtitle").textContent = activeStream.summary;
+        const machines = machineOptions();
+        $("#resume-machine").innerHTML = machines.map(machine => `<option value="${esc(machine.id)}">${esc(machine.displayName)}${machine.current ? " · this machine" : ""}${machine.fresh ? " · fresh" : " · stale"}</option>`).join("");
+        const preferred = machines.find(machine => machine.current) || machines.find(machine => machine.fresh) || machines[0];
+        $("#resume-machine").value = preferred.id;
+        populateAgents(preferred, "codex");
+        $("#resume-harness").value = "bridge";
+        $("#resume-mode").value = "code";
+        $("#resume-focus").value = "";
+        refreshResumeCommand({ preserveWorkspace: false });
+        $("#resume-dialog").showModal();
+      }
+
+      function renderMethod() {
+        $("#method-principles").innerHTML = report.method.principles.map(item => `<li>${esc(item)}</li>`).join("");
+        $("#source-list").innerHTML = report.method.sources.map(item => `<a href="${esc(safeWebUrl(item.url))}" target="_blank" rel="noreferrer"><span>${esc(item.title)}</span><span aria-hidden="true">↗</span></a>`).join("");
+      }
+
+      document.addEventListener("click", event => {
+        const resume = event.target.closest(".resume-button");
+        if (resume) return openResume(resume.dataset.stream);
+        const toggle = event.target.closest("[data-toggle-stream]");
+        if (toggle) {
+          const id = toggle.dataset.toggleStream;
+          openStreams.has(id) ? openStreams.delete(id) : openStreams.add(id);
+          renderStreams();
+          return;
+        }
+        const issueToggle = event.target.closest(".issue-toggle");
+        if (issueToggle) {
+          const id = issueToggle.dataset.stream;
+          expandedIssues.has(id) ? expandedIssues.delete(id) : expandedIssues.add(id);
+          renderStreams();
+        }
+      });
+
+      ["#search", "#evidence-filter", "#issue-filter"].forEach(selector => {
+        $(selector).addEventListener(selector === "#search" ? "input" : "change", renderStreams);
+      });
+
+      $("#collapse-all").addEventListener("click", () => { openStreams.clear(); renderStreams(); });
+      $("#expand-all").addEventListener("click", () => { report.workstreams.forEach(stream => openStreams.add(stream.id)); renderStreams(); });
+      $("#close-dialog").addEventListener("click", () => $("#resume-dialog").close());
+      $("#resume-dialog").addEventListener("click", event => { if (event.target === $("#resume-dialog")) $("#resume-dialog").close(); });
+      $("#resume-machine").addEventListener("change", () => { populateAgents(selectedMachine(), $("#resume-agent").value); refreshResumeCommand({ preserveWorkspace: false }); });
+      ["#resume-agent", "#resume-harness", "#resume-mode"].forEach(selector => $(selector).addEventListener("change", () => refreshResumeCommand()));
+      ["#resume-workspace", "#resume-focus"].forEach(selector => $(selector).addEventListener("input", () => refreshResumeCommand()));
+      $("#copy-command").addEventListener("click", () => copyText($("#resume-command").textContent, "Resume payload copied"));
+      $("#copy-brief").addEventListener("click", () => copyText(continuationBrief(), "Continuation brief copied"));
+
+      renderHero();
+      renderStreams();
+      renderMethod();
+    })();
+  </script>
+</body>
+</html>

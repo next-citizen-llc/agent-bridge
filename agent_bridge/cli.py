@@ -4026,6 +4026,10 @@ def main(argv: list[str]) -> int:
         return harness_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "sessions":
         return sessions_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "workstreams":
+        from .workstream_report import workstreams_cmd
+
+        return workstreams_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "preflight":
         return preflight_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "context":
@@ -4051,6 +4055,7 @@ def main(argv: list[str]) -> int:
     print("       agent code hooks <install|uninstall|status> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
     print("       agent code sessions <inventory|recover> [options]", file=sys.stderr)
+    print("       agent code workstreams report [options]", file=sys.stderr)
     print("       agent code preflight <session|work|status|publish|flush|aggregate|roots|configure> [options]", file=sys.stderr)
     print("       agent code context <install|check|status> --manifest PATH [options]", file=sys.stderr)
     print("       agent code doctor [options]", file=sys.stderr)

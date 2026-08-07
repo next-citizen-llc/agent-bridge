@@ -143,6 +143,29 @@ Inspect recent native-session evidence without importing raw chat history:
 agent code sessions inventory --since-hours 168
 ```
 
+Generate the local cross-harness workstream control center with current harness
+registrations and live GitHub issue links:
+
+```bash
+agent code workstreams report --open
+```
+
+The report engine reads its private catalog from
+`SharedAgentConversations/reports/workstream-control-center/catalog.json` by
+default; pass `--data PATH` to use another catalog. No catalog, private issue
+title, or generated report is packaged in this public repository. The
+self-contained HTML remains local under Agent Bridge's state directory by
+default.
+
+See the [workstream control center guide](docs/workstream-control-center.md)
+for the catalog schema, exact issue/Epic references, generation workflow,
+privacy boundary, cross-platform command semantics, and browser validation.
+
+Each workstream can prepare a resume command or continuation brief for a
+selected agent, execution surface, and machine. The report never injects into
+an existing native chat or silently executes on a remote machine; run the
+copied command on the machine named in the dialog.
+
 Agent Bridge targets the current Git root by default. Use `--project-dir /absolute/path` to target a
 different checkout.
 
@@ -156,6 +179,8 @@ different checkout.
   generated harness context.
 - [Active session recovery](docs/active-session-recovery.md) documents bounded continuation
   handoffs.
+- [Harness-engineering research](docs/research/harness-engineering-workstream-continuity.md)
+  records the evidence and open questions behind the workstream-control boundary.
 
 Agent Bridge is a local-first control plane, not a local-inference guarantee. Prompts sent to a
 vendor CLI may still be transmitted under that tool's own account, privacy, and retention terms.

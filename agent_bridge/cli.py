@@ -96,6 +96,7 @@ from .session_recovery import (
     load_recovery_selection,
     recover_sessions,
 )
+from .skill_retirement import purge_retired_skills
 from .managed_repos import (
     DEFAULT_MANAGED_INTERVAL_SECONDS,
     DEFAULT_MANAGED_TIMEOUT_SECONDS,
@@ -2092,6 +2093,13 @@ Use the installed `agent` command as the front door for local and cross-harness 
 - Dirty, non-main, ahead, or diverged checkouts are never overwritten. Offline starts continue with the last installed revision and cache the failure briefly.
 - Set `AGENT_BRIDGE_DISABLE_AUTO_UPDATE=1` for an emergency startup bypass. Use `agent code update apply --force` to bypass only the normal freshness interval.
 
+## Deprecated Skill Purge
+
+- Every SessionStart hook applies the packaged `retired_skills.json` manifest after updating Agent Bridge and before harness registration.
+- Purges are exact and allowlisted: each entry names an approved root, path pattern, and expected `SKILL.md` name. A missing or mismatched skill is reported and left untouched.
+- Add a retirement only after its replacement is canonical and published. Never add broad cache, plugin, harness, or skill-root paths.
+- Set `AGENT_BRIDGE_DISABLE_SKILL_PURGE=1` for emergency diagnosis; remove the override after correcting the manifest or installation.
+
 ## Managed Repos
 
 - The SessionStart hook can also check repos you track alongside the bridge, so shared sources stay consistent across harnesses, machines, and agents. Inspect with `agent code repos status`; list what is configured with `agent code repos list`.
@@ -2438,6 +2446,7 @@ def session_start_context(
     readiness: dict[str, Any] | None = None,
     update: dict[str, Any] | None = None,
     managed: list[dict[str, Any]] | None = None,
+    retired_skills: dict[str, Any] | None = None,
 ) -> str:
     cwd = os.environ.get("PWD") or str(Path.cwd())
     git_root = _git_root_for_path(cwd)
@@ -2460,6 +2469,10 @@ def session_start_context(
         f" Agent Bridge revision: `{revision}`; startup refresh: "
         f"`{update_result.get('status', 'unknown')}`."
     )
+    purged = (retired_skills or {}).get("purged") or []
+    retirement_text = (
+        f" Deprecated-skill purge removed {len(purged)} installation(s)." if purged else ""
+    )
     return (
         "Agent Bridge session bootstrap: global command `agent` is available for bounded local "
         "agent coordination. Use `agent code bridge` for one-shot headless review/code turns and "
@@ -2470,7 +2483,7 @@ def session_start_context(
         "OneDrive harness registrations. This startup hook never spawns agents or mutates the active project; "
         "its bounded updater only fast-forwards clean canonical checkouts and never modifies report-only repos. "
         f"Client: {client}. Surface: {surface}."
-        f"{location}{update_text}{registry}{readiness_text}{format_managed_repos(managed or [])}"
+        f"{location}{update_text}{retirement_text}{registry}{readiness_text}{format_managed_repos(managed or [])}"
     )
 
 
@@ -2549,6 +2562,10 @@ def hook_session_start(argv: list[str]) -> int:
                 ],
                 env,
             )
+    try:
+        retired_skills = purge_retired_skills()
+    except Exception as exc:
+        retired_skills = {"status": "error", "purged": [], "errors": [type(exc).__name__]}
     registration = maybe_register_harness(args.client, surface=surface, startup_mechanism=args.startup_mechanism)
     try:
         readiness = run_preflight(
@@ -2579,6 +2596,7 @@ def hook_session_start(argv: list[str]) -> int:
         readiness=readiness,
         update=update,
         managed=managed,
+        retired_skills=retired_skills,
     )
     if args.plain:
         print(context)

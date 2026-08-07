@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "retirements": [
+    {
+      "id": "anthropic-skills:jobapp",
+      "root": "codex_plugin_cache",
+      "path": ["claude-cowork", "anthropic-skills", "*", "skills", "jobapp"],
+      "skill_name": "jobapp",
+      "replacement": "skills-vault/skills/jobapp"
+    }
+  ]
+}

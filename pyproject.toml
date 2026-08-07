@@ -43,4 +43,4 @@ packages = ["agent_bridge"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-agent_bridge = ["agents.json", "surfaces.json", "readiness_schema.json", "workflows/*.json"]
+agent_bridge = ["agents.json", "surfaces.json", "readiness_schema.json", "retired_skills.json", "workflows/*.json"]

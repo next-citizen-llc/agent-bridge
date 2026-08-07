@@ -2067,7 +2067,7 @@ def repair_cmd(argv: list[str]) -> int:
 def render_agent_bridge_skill() -> str:
     return f"""---
 name: agent-bridge
-description: Use when coordinating Codex, Claude, or other coding harnesses through Agent Bridge; recovering interrupted native sessions after usage or API limits; checking shared OneDrive harness status; registering a harness heartbeat; using mailbox MCP; or invoking agent code bridge, loop, workflow, hooks, or harness commands across macOS and Windows machines.
+description: Use when coordinating Codex, Claude, or other coding harnesses through Agent Bridge; synchronizing Codex sessions and project structure; recovering interrupted native sessions after usage or API limits; checking shared OneDrive harness status; registering a harness heartbeat; using mailbox MCP; or invoking agent code bridge, loop, workflow, hooks, or harness commands across macOS and Windows machines.
 ---
 
 # Agent Bridge
@@ -2084,6 +2084,7 @@ Use the installed `agent` command as the front door for local and cross-harness 
 - List the configured managed repos and their modes: `agent code repos list`
 - List callable local engines: `agent code bridge --list`
 - Inspect trace events: `agent code trace`
+- Inspect incremental Codex state sync: `agent code state-sync status`
 
 ## Automatic Update
 
@@ -2125,6 +2126,14 @@ Use the installed `agent` command as the front door for local and cross-harness 
 - Recovery artifacts stay under `{STATE_DIR / 'session-recovery'}`. They contain bounded, credential-redacted context and pointers to native evidence, never copied raw transcripts.
 - A recovery task is a durable handoff, not proof that a native target chat was created. The target harness must create or claim one isolated task per handoff and preserve the exact project/worktree.
 - Re-verify Git, pull-request, artifact, and other live state before continuing. Use `--verify-github` when GitHub PR evidence is part of completion classification.
+
+## Codex State Sync
+
+- Publish the first baseline and later append-aware deltas with `agent code state-sync publish`.
+- Review remote machines with `agent code state-sync status`; preview a merge with `agent code state-sync apply --dry-run`.
+- Import is additive and requires Codex Desktop to be closed: `agent code state-sync apply --yes`. It preserves target-only sessions and project assignments, maps project roots through the shared registry, and never deletes retained session objects.
+- Install an hourly publisher with `agent code state-sync install-scheduler`. Add `--pull` only when automatic import on a closed Codex Desktop is intended.
+- The legacy full sidebar bundle scripts remain a manual recovery path, not the recurring synchronization mechanism.
 
 ## Readiness and Context
 
@@ -4026,6 +4035,10 @@ def main(argv: list[str]) -> int:
         return harness_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "sessions":
         return sessions_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "state-sync":
+        from .state_sync import state_sync_cmd
+
+        return state_sync_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "preflight":
         return preflight_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "context":
@@ -4051,6 +4064,7 @@ def main(argv: list[str]) -> int:
     print("       agent code hooks <install|uninstall|status> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
     print("       agent code sessions <inventory|recover> [options]", file=sys.stderr)
+    print("       agent code state-sync <publish|apply|sync|status|install-scheduler|uninstall-scheduler> [options]", file=sys.stderr)
     print("       agent code preflight <session|work|status|publish|flush|aggregate|roots|configure> [options]", file=sys.stderr)
     print("       agent code context <install|check|status> --manifest PATH [options]", file=sys.stderr)
     print("       agent code doctor [options]", file=sys.stderr)

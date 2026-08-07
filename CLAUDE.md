@@ -47,9 +47,12 @@ There is no lint/format config and no Makefile. `pyproject.toml` exposes the con
 - **Zero runtime dependencies.** `dependencies = []` in `pyproject.toml`, `requires-python >=3.11`,
   and the MCP server is deliberately "dependency-free stdio". Use only the Python standard library
   in `agent_bridge/`. Do not introduce third-party packages (no requests, no MCP SDK, etc.).
-- **Runtime state lives outside the repo.** Everything writes under `~/.local/state/agent-bridge/`
-  (override with `AGENT_BRIDGE_STATE_DIR`). `.gitignore` blocks `state/`, `transcripts/`,
-  `mailbox/`, `bridge_agents.log`. Never commit runtime artifacts or add state paths inside the repo.
+- **Runtime state lives outside the repo.** Bridge operational state writes under
+  `~/.local/state/agent-bridge/` (override with `AGENT_BRIDGE_STATE_DIR`). The explicit exception is
+  private cross-machine Codex state sync, which writes immutable chunks and per-machine metadata
+  under the configured OneDrive `SharedAgentData/AgentBridgeStateSync/v1` root. `.gitignore` blocks
+  `state/`, `transcripts/`, `mailbox/`, `bridge_agents.log`. Never commit runtime artifacts or add
+  state paths inside the repo.
 - **`review` mode is analysis-only; `code` mode may edit files.** Preserve this split when touching
   dispatch: review runs read-only / `--permission-mode auto` / `sandbox=read-only`; code runs
   `acceptEdits` / `workspace-write`. No live production actions, credentials, deploys, or direct
@@ -89,6 +92,11 @@ same `AGENT_BRIDGE_STATE_DIR` env pattern — keep that consistent if you add on
 indexes, stores private handoffs under `session-recovery/<run_id>/`, and optionally attaches them to
 the task ledger. It must not copy raw transcripts, system prompts, account metadata, or tool-result
 dumps into a recovery bundle.
+
+`state_sync.py` is a separate, explicitly private Codex-history surface. It chunk-deduplicates
+native sessions into `SharedAgentData`, publishes normalized project/thread indexes, and additively
+merges them only while Codex Desktop is closed. It must not copy log databases, config, credentials,
+or caches; it must not automatically delete or expire session objects.
 
 ### mailbox_mcp.py is a raw JSON-RPC stdio loop
 No SDK. It implements `initialize`, `notifications/initialized`, `tools/list`, `tools/call` by hand

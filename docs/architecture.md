@@ -10,6 +10,7 @@ flowchart LR
     C --> L["Loop: builder / critic / verifier"]
     C --> W["Workflow engine"]
     C --> R["Session recovery"]
+    C --> X["Incremental Codex state sync"]
     B --> A["Target adapter"]
     L --> A
     W --> A
@@ -19,6 +20,7 @@ flowchart LR
     R --> S
     M["Mailbox MCP"] <--> S
     H["Harness heartbeat registry"] <--> C
+    X <--> D["Private SharedAgentData chunk store"]
 ```
 
 ## Components
@@ -32,6 +34,7 @@ flowchart LR
 | `agent_bridge/workflow.py` | Portable multi-phase workflow execution and stored results | Invoked engines retain their own provider boundary |
 | `agent_bridge/session_recovery.py` | Bounded inventory and redacted continuation handoffs | Does not import raw native chat history |
 | `agent_bridge/readiness.py` | Typed client and source readiness evidence | Evidence is scoped to a client, surface, machine, project, and time |
+| `agent_bridge/state_sync.py` | Append-aware Codex session objects plus additive project/sidebar merge | Private OneDrive transport; no automatic deletion or live-Desktop import |
 
 ## Dispatch path
 
@@ -58,6 +61,13 @@ The default state root is:
 It contains task and event JSONL, findings, verdicts, mailbox messages, workflow artifacts,
 transcripts, media conversions, and session-recovery bundles. Set `AGENT_BRIDGE_STATE_DIR` to move
 this state to another local directory.
+
+Codex state sync is an explicit private-history surface outside that default
+runtime root. It stores immutable compressed chunks and per-machine metadata in
+the configured OneDrive `SharedAgentData/AgentBridgeStateSync/v1` tree. An
+hourly LaunchAgent or Task Scheduler job calls the same one-shot CLI; it is not
+a daemon. Publication may run against live append-only transcripts, but native
+index import is deferred until Codex Desktop is closed.
 
 Cross-machine harness registration is a OneDrive-friendly heartbeat store. A fresh record means a
 harness recently wrote to the shared folder; it does not prove that a UI session is idle, connected,

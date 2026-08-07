@@ -1,172 +1,137 @@
-# Codex Sidebar State Sync
+# Codex Session and Project State Sync
 
-This runbook copies the Codex Desktop state that controls visible sessions and
-workspace groupings in the sidebar from one machine to another.
+Use the incremental state sync for normal Mac/Windows continuity. It publishes
+one initial baseline into OneDrive, then only changed compressed chunks and
+small metadata indexes. Imports merge sessions and sidebar/project structure;
+they do not replace target-only state.
 
-Use it when a second machine should show the same Codex sessions and the same
-workspace/project entries as the source machine.
+## What is synchronized
 
-## What Gets Synced
+- live and archived Codex session JSONL;
+- attachments and generated images;
+- thread titles, timestamps, archive/pin state, rollout paths, and project
+  working directories from `state_5.sqlite`;
+- local project definitions, thread-project assignments, sidebar order,
+  workspace hints, pinned threads, and projectless threads.
 
-The helper copies the state surfaces that affect sidebar sessions and workspace
-grouping:
+The sync excludes Codex log databases, config, credentials, caches, plugins,
+MCP state, and the native SQLite database file. OneDrive carries the private
+state archive; GitHub carries the Agent Bridge code.
 
-- `~/.codex/state_5.sqlite`
-- `~/.codex/sqlite/state_5.sqlite`
-- `~/.codex/.codex-global-state.json`
-- `~/.codex/session_index.jsonl`
-- `~/.codex/external_agent_session_imports.json`
-- `~/.codex/config.toml`
-- `~/.codex/sessions/`
-- `~/.codex/archived_sessions/`
-- `~/.codex/ambient-suggestions/`
-- `~/.codex/attachments/`
-- `~/.codex/generated_images/`
+## Trust and privacy boundary
 
-`state_5.sqlite` contains the `threads.cwd` values that drive sidebar grouping.
-`.codex-global-state.json` contains workspace labels and ordering, including
-`electron-workspace-root-labels`, `project-order`, saved workspace roots, and
-thread workspace hints.
+This archive copies included session JSONL, raw prompts and tool content,
+attachments, and generated images as-is. It is not encrypted and manifests are
+not cryptographically source-authenticated; machine IDs are routing labels, not
+proof of source identity. Use only a trusted, private `SharedAgentData` root
+and do not apply manifests from an untrusted source. Excluding Codex config or
+credential stores is a path-selection boundary only: it does not scan included
+session content for secrets or redact history.
 
-The helper does not copy plugin caches, credentials, MCP installs, shell
-snapshots, or generated runtime folders.
+## First baseline
 
-Review `config.toml` before sharing a bundle outside your own trusted machines.
-It is included because workspace migration can depend on it, but local MCP paths
-or machine-specific settings may need adjustment on the target.
-
-## Assumptions
-
-- The target machine can access the same workspace paths, or equivalent folders
-  have already been created at the same absolute paths.
-- The operator accepts that import makes the target Codex sidebar/session state
-  match the source bundle. Target state is backed up first, but then overwritten.
-- Codex Desktop should be restarted after import. The app keeps sidebar state in
-  memory while running.
-
-## Source Machine: Export
-
-Pick a synced location both machines can read, for example a shared OneDrive
-folder:
-
-macOS/Linux:
+On either machine:
 
 ```bash
-SYNC_ROOT="$HOME/Library/CloudStorage/OneDrive-nextcz.com/SharedAgentData/CodexSidebarSync"
-BUNDLE="$SYNC_ROOT/$(hostname)-$(date -u +%Y%m%dT%H%M%SZ)"
-
 cd "$HOME/Code/agent-bridge"
-scripts/codex-sidebar-sync.sh export --out "$BUNDLE"
+agent code state-sync publish
+agent code state-sync status
 ```
 
-Windows PowerShell:
+PowerShell uses the same `agent` command after Agent Bridge is installed:
 
 ```powershell
-$SyncRoot = Join-Path $env:OneDrive "SharedAgentData\CodexSidebarSync"
-$Bundle = Join-Path $SyncRoot ("$env:COMPUTERNAME-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ"))
-
 cd "$HOME\Code\agent-bridge"
-.\scripts\codex-sidebar-sync.ps1 export -Out $Bundle
+agent code state-sync publish
+agent code state-sync status
 ```
 
-The export uses SQLite `.backup` for live databases rather than raw-copying
-WAL-backed files.
+The default shared location is the configured `SharedAgentData` root. Pass
+`--shared-root <SharedAgentData-path>` only when root discovery is not already
+configured identically on both machines.
 
-## Target Machine: Import, Refresh, Restart
+The first publication reads the full retained corpus. Wait for OneDrive to make
+the manifest and referenced objects available on the other machine before the
+first import.
 
-After the bundle is visible on the target machine:
+## Preview and import
 
-macOS target:
+Preview is read-only and may run while Codex is open:
 
 ```bash
-BUNDLE="/path/to/CodexSidebarSync/<source-host>-<timestamp>"
-
-cd "$HOME/Code/agent-bridge"
-scripts/codex-sidebar-sync.sh import \
-  --from "$BUNDLE" \
-  --yes \
-  --refresh-sidebar \
-  --restart
+agent code state-sync apply --dry-run
 ```
 
-Windows target:
-
-```powershell
-$Bundle = "$env:OneDrive\SharedAgentData\CodexSidebarSync\<source-host>-<timestamp>"
-
-cd "$HOME\Code\agent-bridge"
-.\scripts\codex-sidebar-sync.ps1 import `
-  -From $Bundle `
-  -Yes `
-  -RefreshSidebar `
-  -Restart
-```
-
-`--refresh-sidebar` validates `state_5.sqlite` with `pragma integrity_check` and
-writes a refresh marker under `~/.codex/backups/sidebar-state-sync-refresh/`.
-
-`--restart` quits `Codex.app` on macOS before import, then reopens it after the
-copied state is in place. On Windows, `-Restart` stops a running `Codex` process
-before import and starts `Codex.exe` afterward when it can resolve the install
-path; if it cannot, start Codex Desktop manually after the import.
-
-## Common Directional Flows
-
-To push this Mac's Codex conversations and workspaces to the Windows Desktop:
-
-1. Export on the Mac into `SharedAgentData/CodexSidebarSync`.
-2. Wait for OneDrive to finish syncing the bundle to Windows.
-3. On `DESKTOP-785F6GB`, import that bundle with the Windows target command.
-
-To pull the Windows Desktop's Codex conversations and workspaces back to this
-Mac:
-
-1. Export on `DESKTOP-785F6GB` with the Windows source command.
-2. Wait for OneDrive to finish syncing the bundle to this Mac.
-3. Import that bundle on the Mac with the macOS target command.
-
-## Target Backup and Rollback
-
-Every import writes a target backup before replacing files:
-
-```text
-~/.codex/backups/sidebar-state-sync-<timestamp>/
-```
-
-To roll back, import that backup bundle:
+For the actual merge, fully quit Codex Desktop, then run:
 
 ```bash
-cd "$HOME/Code/agent-bridge"
-scripts/codex-sidebar-sync.sh import \
-  --from "$HOME/.codex/backups/sidebar-state-sync-<timestamp>" \
-  --yes \
-  --refresh-sidebar \
-  --restart
+agent code state-sync apply --yes
 ```
 
-## Verification
-
-After restart, verify the target sidebar:
-
-1. The expected workspace labels appear.
-2. Recent source-machine sessions are present under the same workspaces.
-3. No old duplicate workspace roots reappeared.
-
-For a CLI check:
+Select one source when needed:
 
 ```bash
-sqlite3 "$HOME/.codex/state_5.sqlite" \
-  "select cwd, count(*) from threads group by cwd order by count(*) desc limit 20;"
-
-jq '."electron-workspace-root-labels"' "$HOME/.codex/.codex-global-state.json"
+agent code state-sync apply --from-machine <machine-id> --yes
 ```
 
-If labels or projects still look stale, fully quit Codex Desktop, confirm no
-Codex process remains, and reopen it:
+Override an unresolved project-root mapping explicitly:
 
 ```bash
-osascript -e 'tell application "Codex" to quit'
-sleep 2
-pgrep -fl Codex || true
-open -a Codex
+agent code state-sync apply \
+  --path-map '/Users/name/Code/project=C:\Users\name\Code\project' \
+  --yes
 ```
+
+The importer creates a native metadata backup before modifying indexes. If
+session histories diverge, it keeps the target copy and stages the remote copy
+under `~/.codex/session-sync-conflicts/` for review.
+
+## Ongoing delta sync
+
+Install an hourly publisher on each machine:
+
+```bash
+agent code state-sync install-scheduler
+```
+
+To make it bidirectional, explicitly enable pull on each machine:
+
+```bash
+agent code state-sync install-scheduler --pull
+```
+
+The pull job never changes native state while Codex Desktop is running. It
+writes a pending marker and retries on a later scheduled run after Codex is
+closed. Check with:
+
+```bash
+agent code state-sync status
+```
+
+Remove only the exact Agent Bridge scheduler with:
+
+```bash
+agent code state-sync uninstall-scheduler
+```
+
+## Retention
+
+There is no automatic deletion, expiration, or garbage collection. Immutable
+objects and disappeared-source catalog records remain retained. Do not manually
+remove `AgentBridgeStateSync/v1` objects unless the loss and recovery impact has
+been reviewed explicitly.
+
+## Legacy full replacement bundle
+
+The older scripts remain available only as a manual disaster-recovery path:
+
+- `scripts/codex-sidebar-sync.sh`
+- `scripts/codex-sidebar-sync.ps1`
+
+They produce timestamped full copies and replace target-native state after a
+backup. They also include surfaces that recurring sync does not need. Do not use
+them for hourly or routine synchronization.
+
+The legacy full export command and rollback procedure remain available through
+each script's `--help` / PowerShell help. Preserve any existing bundle until the
+incremental baseline and cross-machine import have been verified.

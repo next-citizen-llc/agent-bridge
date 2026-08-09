@@ -2096,7 +2096,7 @@ Use the installed `agent` command as the front door for local and cross-harness 
 ## Managed Repos
 
 - The SessionStart hook can also check repos you track alongside the bridge, so shared sources stay consistent across harnesses, machines, and agents. Inspect with `agent code repos status`; list what is configured with `agent code repos list`.
-- The registry ships **empty**. Agent Bridge embeds no repo names, clone URLs, or filesystem paths; declare them per machine in `{STATE_DIR / 'managed-repos.json'}`. With no config file the sweep is inert and silent.
+- The registry ships **empty**. Agent Bridge embeds no repo names, clone URLs, or filesystem paths; declare them per machine in `~/.local/state/agent-bridge/managed-repos.json` on macOS/Linux or `%USERPROFILE%\\.local\\state\\agent-bridge\\managed-repos.json` on Windows. With no config file the sweep is inert and silent.
 - Repos declared `apply` are fast-forwarded through the same hardened path as the bridge: clean declared branch only, verified `origin`, ff-only. Repos declared `report` are read-only and never mutated. Use `report` for any repo that carries generated output, since a routinely dirty tree would pin `apply` in `blocked_dirty` forever.
 - Two failure modes are reported separately. Being behind `origin` is a sync problem a pull fixes. Work held as uncommitted local edits exists on no remote, so no pull on any other machine would ever retrieve it; those files are listed individually under `canonical_paths`.
 - A dirty checkout blocks its own update and still reports how far behind it is. Warning states, and states where drift was never determined (`busy`, `offline`, `disabled`), are never served from cache and never counted as current.
@@ -2115,7 +2115,7 @@ Use the installed `agent` command as the front door for local and cross-harness 
 
 - When one harness hits a usage or API limit, start with `agent code sessions inventory` to reconcile its native metadata and transcript pointers.
 - Use `agent code sessions recover --continue <session-id> --to codex --enqueue` only after reviewing which sessions are genuinely unfinished. Mark proven completed sessions with `--complete` so they are recorded but not duplicated.
-- Recovery artifacts stay under `{STATE_DIR / 'session-recovery'}`. They contain bounded, credential-redacted context and pointers to native evidence, never copied raw transcripts.
+- Recovery artifacts stay under `~/.local/state/agent-bridge/session-recovery` on macOS/Linux or `%USERPROFILE%\\.local\\state\\agent-bridge\\session-recovery` on Windows. They contain bounded, credential-redacted context and pointers to native evidence, never copied raw transcripts.
 - A recovery task is a durable handoff, not proof that a native target chat was created. The target harness must create or claim one isolated task per handoff and preserve the exact project/worktree.
 - Re-verify Git, pull-request, artifact, and other live state before continuing. Use `--verify-github` when GitHub PR evidence is part of completion classification.
 
@@ -2138,13 +2138,13 @@ Use the installed `agent` command as the front door for local and cross-harness 
 
 ## Media Handling
 
-- When a bridge or loop prompt references an existing `.heic` or `.heif` file path, Agent Bridge converts it to PNG under `{MEDIA_DIR}` and appends an `[AGENT BRIDGE MEDIA]` note with the converted path.
+- When a bridge or loop prompt references an existing `.heic` or `.heif` file path, Agent Bridge converts it to PNG under `~/.local/state/agent-bridge/media` on macOS/Linux or `%USERPROFILE%\\.local\\state\\agent-bridge\\media` on Windows, and appends an `[AGENT BRIDGE MEDIA]` note with the converted path.
 - Claude Code dispatches also receive the media cache through `--add-dir`; set `AGENT_BRIDGE_HEIC_CONVERTER` to override the default converter command.
 
 ## Connection Repair
 
 - Use `AGENT_BRIDGE_CLAUDE_EMAIL=<email> agent code repair --to claude` when a target CLI reports stale auth, 401 credentials, or budget calibration trouble.
-- Bridge and loop dispatches retry `Exceeded USD budget (...)` failures automatically up to `AGENT_BRIDGE_MAX_AUTO_BUDGET_USD` or `--max-auto-budget-usd`, then persist the working cap under `{CONNECTION_STATE}`.
+- Bridge and loop dispatches retry `Exceeded USD budget (...)` failures automatically up to `AGENT_BRIDGE_MAX_AUTO_BUDGET_USD` or `--max-auto-budget-usd`, then persist the working cap under `~/.local/state/agent-bridge/connections.json` on macOS/Linux or `%USERPROFILE%\\.local\\state\\agent-bridge\\connections.json` on Windows.
 - Use `--no-budget-auto` on bridge or loop calls when an explicit hard budget should fail instead of retrying.
 
 ## Shared Registry
@@ -2166,6 +2166,22 @@ to the legacy username-and-hostname key.
 Registry rows older than `{REGISTRY_EXPIRY_DAYS}` days are pruned during status
 inspection. Use `agent code harness status --no-prune` for a read-only view that
 retains expired rows.
+
+## New Project Location
+
+- Create, clone, scaffold, or initialize every new project as a direct child of
+  the current human user's home-directory `Code` folder.
+- Use `~/Code/<project-name>` on macOS and Linux, and
+  `%USERPROFILE%\\Code\\<project-name>` on Windows.
+- Resolve the real home directory before acting. Never create literal `~User`,
+  `~`, or `%USERPROFILE%` path segments.
+- Do not place a new project under Desktop, Documents, Downloads, OneDrive,
+  another cloud-synced folder, a temporary directory, or inside another
+  project unless Tristan explicitly overrides this rule for that project.
+- Verify the intended absolute path before creating files or initializing
+  version control there.
+- This rule governs new project roots. Do not move or rename an existing
+  project automatically.
 
 ## Path Rules
 

@@ -379,6 +379,7 @@ class StateSyncTests(unittest.TestCase):
                     project_registry=registry,
                     source_machines=["source-machine"],
                     current_machine="target-machine",
+                    platform_name="windows",
                     yes=True,
                 )
 
@@ -391,6 +392,7 @@ class StateSyncTests(unittest.TestCase):
                     project_registry=registry,
                     source_machines=["source-machine"],
                     current_machine="target-machine",
+                    platform_name="windows",
                     yes=True,
                 )
             self.assertEqual(result["artifact_results"]["conflict"], 1)

@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage:
   scripts/codex-sidebar-sync.sh export --out DIR [--codex-home DIR]
-  scripts/codex-sidebar-sync.sh import --from DIR --yes [--codex-home DIR] [--refresh-sidebar] [--restart]
+  scripts/codex-sidebar-sync.sh import --from DIR --yes [--codex-home DIR] [--refresh-sidebar] [--restart] [--allow-platform-mismatch]
 
 Copies the Codex Desktop state that drives sessions and sidebar workspaces.
 
@@ -19,6 +19,9 @@ Options:
   --yes                 Required for import because target state is overwritten.
   --refresh-sidebar     Validate imported state and write a refresh marker.
   --restart             Quit Codex.app before import and reopen it afterward.
+  --allow-platform-mismatch
+                        Explicit disaster-recovery override; pointer-sync is the
+                        supported cross-platform mechanism.
   -h, --help            Show this help.
 EOF
 }
@@ -34,6 +37,24 @@ need_cmd() {
 
 timestamp() {
   date -u +%Y%m%dT%H%M%SZ
+}
+
+current_platform() {
+  case "$(uname -s)" in
+    Darwin) printf 'macos\n' ;;
+    Linux) printf 'linux\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
 }
 
 default_codex_home() {
@@ -71,14 +92,18 @@ write_manifest() {
   local bundle="$1"
   local codex_home="$2"
   local mode="$3"
+  local hostname_json codex_home_json
+  hostname_json="$(json_escape "$(hostname)")"
+  codex_home_json="$(json_escape "$codex_home")"
   cat >"$bundle/manifest.json" <<EOF
 {
   "schema_version": "1.0",
   "kind": "codex_sidebar_state_bundle",
   "mode": "$mode",
   "created_at": "$(timestamp)",
-  "hostname": "$(hostname)",
-  "source_codex_home": "$codex_home"
+  "hostname": "$hostname_json",
+  "platform": "$(current_platform)",
+  "source_codex_home": "$codex_home_json"
 }
 EOF
 }
@@ -161,18 +186,47 @@ open_codex() {
   printf 'Opened Codex.app\n'
 }
 
+codex_writer_pids() {
+  pgrep -f 'Codex\.app|codex-code-mode-host|/codex([[:space:]]|$)' || true
+}
+
 import_bundle() {
   local codex_home="$1"
   local from="$2"
   local refresh="$3"
   local restart="$4"
-  need_cmd rsync
-  need_cmd sqlite3
+  local allow_platform_mismatch="$5"
   [[ -d "$from" ]] || die "bundle directory not found: $from"
   [[ -f "$from/manifest.json" ]] || die "bundle manifest not found: $from/manifest.json"
+  local source_kind source_platform source_home target_platform
+  source_kind="$(sed -n 's/.*"kind"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$from/manifest.json" | head -n 1)"
+  [[ "$source_kind" == "codex_sidebar_state_bundle" ]] || die "unrecognized bundle manifest kind: $source_kind"
+  source_platform="$(sed -n 's/.*"platform"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$from/manifest.json" | head -n 1)"
+  source_home="$(sed -n 's/.*"source_codex_home"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$from/manifest.json" | head -n 1)"
+  if [[ -z "$source_platform" ]]; then
+    case "$source_home" in
+      /Users/*) source_platform="macos" ;;
+      /home/*|/root/*) source_platform="linux" ;;
+      [A-Za-z]:*|\\\\*) source_platform="windows" ;;
+    esac
+  fi
+  target_platform="$(current_platform)"
+  if [[ -n "$source_platform" && "$source_platform" != "$target_platform" && "$allow_platform_mismatch" != "1" ]]; then
+    die "refusing $source_platform bundle import into $target_platform; use Agent Bridge pointer-sync instead (or pass --allow-platform-mismatch for explicit disaster recovery)"
+  fi
+  need_cmd rsync
+  need_cmd sqlite3
+  need_cmd pgrep
+  local writers
+  writers="$(codex_writer_pids)"
+  if [[ -n "$writers" && "$restart" != "1" ]]; then
+    die "close Codex before import, or pass --restart to stop detected writer processes"
+  fi
   mkdir -p "$codex_home"
   if [[ "$restart" == "1" ]]; then
     quit_codex
+    writers="$(codex_writer_pids)"
+    [[ -z "$writers" ]] || die "Codex writer processes are still active: ${writers//$'\n'/,}"
   fi
 
   local backup_dir
@@ -216,6 +270,7 @@ from=""
 yes="0"
 refresh="0"
 restart="0"
+allow_platform_mismatch="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -246,6 +301,10 @@ while [[ $# -gt 0 ]]; do
       restart="1"
       shift
       ;;
+    --allow-platform-mismatch)
+      allow_platform_mismatch="1"
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -270,7 +329,7 @@ case "$mode" in
   import)
     [[ -n "$from" ]] || die "import requires --from DIR"
     [[ "$yes" == "1" ]] || die "import overwrites target state; pass --yes after reviewing the bundle"
-    import_bundle "$codex_home" "$from" "$refresh" "$restart"
+    import_bundle "$codex_home" "$from" "$refresh" "$restart" "$allow_platform_mismatch"
     ;;
   -h|--help|help)
     usage

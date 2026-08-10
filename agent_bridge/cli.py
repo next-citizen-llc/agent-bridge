@@ -2495,6 +2495,11 @@ def hook_session_start(argv: list[str]) -> int:
     parser.add_argument("--plain", action="store_true", help="Print plain context instead of hook JSON")
     parser.add_argument("--skip-update", action="store_true", help="Skip the automatic refresh for this invocation.")
     parser.add_argument(
+        "--skip-pointer-sync",
+        action="store_true",
+        help="Skip the bounded Codex pointer-catalog publication for this invocation.",
+    )
+    parser.add_argument(
         "--skip-managed-repos",
         action="store_true",
         help="Skip the canonical managed-repo drift check for this invocation.",
@@ -2589,6 +2594,26 @@ def hook_session_start(argv: list[str]) -> int:
             )
         except Exception:
             managed = []
+    pointer_snapshot: dict[str, Any] | None = None
+    pointer_sync_disabled = os.environ.get("AGENT_BRIDGE_POINTER_SYNC_DISABLED", "").casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if args.client.casefold() == "codex" and not args.skip_pointer_sync and not pointer_sync_disabled:
+        try:
+            from .pointer_sync import publish_pointer_snapshot
+
+            pointer_snapshot = publish_pointer_snapshot(
+                discover_code_roots=False,
+                discover_thread_roots=False,
+                preserve_existing_projects=True,
+            )
+        except Exception as exc:
+            # Pointer publication is optional and must never gate Codex startup
+            # or expose filesystem/database error details in hook context.
+            pointer_snapshot = {"status": "error", "detail": type(exc).__name__}
     context = session_start_context(
         args.client,
         surface=surface,
@@ -2598,6 +2623,16 @@ def hook_session_start(argv: list[str]) -> int:
         managed=managed,
         retired_skills=retired_skills,
     )
+    if pointer_snapshot:
+        pointer_status = str(pointer_snapshot.get("status") or "unknown")
+        if pointer_status == "published":
+            context += (
+                " Pointer catalog: published "
+                f"{int(pointer_snapshot.get('project_count') or 0)} project(s) and "
+                f"{int(pointer_snapshot.get('conversation_count') or 0)} recent task pointer(s)."
+            )
+        else:
+            context += f" Pointer catalog: `{pointer_status}` (startup continued)."
     if args.plain:
         print(context)
     else:
@@ -3699,7 +3734,11 @@ def workflow_cmd(argv: list[str]) -> int:
             print("")
             print("Tiers:")
             for tier, cfg in spec.get("tiers", {}).items():
-                print(f"- {tier}: {cfg.get('angles')} angles, {cfg.get('fetch')} sources, {cfg.get('claims')} claims")
+                summary = cfg.get("summary")
+                if summary:
+                    print(f"- {tier}: {summary}")
+                else:
+                    print(f"- {tier}: {cfg.get('angles')} angles, {cfg.get('fetch')} sources, {cfg.get('claims')} claims")
         return 0
 
     if args.cmd == "inspect":
@@ -3762,6 +3801,10 @@ def workflow_cmd(argv: list[str]) -> int:
         print(format_report(result), end="")
         print("")
         print(json.dumps(result, indent=2, sort_keys=True))
+    if result.get("status") in {"failed", "failed_validation", "failed_execution", "failed_verification", "failed_integration"}:
+        return 1
+    if result.get("status") == "declined":
+        return 2
     return 0
 
 
@@ -4018,6 +4061,14 @@ def main(argv: list[str]) -> int:
         return update_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "repos":
         return repos_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "pointer-sync":
+        from .pointer_sync import pointer_sync_cmd
+
+        return pointer_sync_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "sidebar-repair":
+        from .sidebar_repair import sidebar_repair_cmd
+
+        return sidebar_repair_cmd(argv[2:])
     if len(argv) >= 3 and argv[0] == "code" and argv[1] == "hook" and argv[2] == "session-start":
         return hook_session_start(argv[3:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "hooks":
@@ -4026,6 +4077,10 @@ def main(argv: list[str]) -> int:
         return harness_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "sessions":
         return sessions_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "state-sync":
+        from .state_sync import state_sync_cmd
+
+        return state_sync_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "preflight":
         return preflight_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "context":
@@ -4047,10 +4102,19 @@ def main(argv: list[str]) -> int:
     print("       agent code cache <key|put|get> [options]", file=sys.stderr)
     print("       agent code optimize <route|cacheability|compress> [options]", file=sys.stderr)
     print("       agent code update <status|check|apply> [options]", file=sys.stderr)
+    print("       agent code pointer-sync <publish|status|recent|projects|install-scheduler|uninstall-scheduler> [options]", file=sys.stderr)
+    print(
+        "       agent code sidebar-repair <preview|stage|status|apply|apply-remap|apply-pending> [options]",
+        file=sys.stderr,
+    )
     print("       agent code hook session-start [options]", file=sys.stderr)
     print("       agent code hooks <install|uninstall|status> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
     print("       agent code sessions <inventory|recover> [options]", file=sys.stderr)
+    print(
+        "       agent code state-sync <publish|apply|sync|status|install-scheduler|uninstall-scheduler> [options]",
+        file=sys.stderr,
+    )
     print("       agent code preflight <session|work|status|publish|flush|aggregate|roots|configure> [options]", file=sys.stderr)
     print("       agent code context <install|check|status> --manifest PATH [options]", file=sys.stderr)
     print("       agent code doctor [options]", file=sys.stderr)

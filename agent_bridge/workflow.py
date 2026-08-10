@@ -25,6 +25,7 @@ from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .agent_team import run_agent_team
 from .correlation import ensure_run_meta, format_meta, safe_fragment
 from .optimization import (
     build_scorecard,
@@ -41,6 +42,7 @@ from .trace import emit_event, events_path, state_dir
 
 WORKFLOW_DIR = Path(__file__).resolve().parent / "workflows"
 DEFAULT_WORKFLOW_ID = "deep-research-lite"
+SUPPORTED_WORKFLOW_RUNNERS = {"deep-research-lite", "agent-team"}
 ENGINE_IDS = {"codex", "claude"}
 DEFAULT_PRICING_USD_PER_MTOK = {
     "codex": {
@@ -129,10 +131,19 @@ def validate_workflow_spec(spec: dict[str, Any], path: Path | None = None) -> No
     for tier in ("shallow", "standard", "deep"):
         if tier not in spec["tiers"]:
             raise WorkflowError(f"{source}workflow spec is missing tier {tier!r}")
-    for schema in ("scope", "search", "extract", "dedup", "verdict", "report", "critic"):
+    runner = str(spec.get("runner") or spec.get("id") or "")
+    required_schemas = {
+        "deep-research-lite": ("scope", "search", "extract", "dedup", "verdict", "report", "critic"),
+        "agent-team": ("scope", "collector", "shard", "worker", "verifier", "integrate"),
+    }.get(runner, ())
+    required_prompts = {
+        "deep-research-lite": ("scope", "search", "fetch", "dedup", "verify", "synthesize", "critic"),
+        "agent-team": ("scope", "collect", "shard", "execute", "verify", "integrate"),
+    }.get(runner, ())
+    for schema in required_schemas:
         if schema not in spec["schemas"]:
             raise WorkflowError(f"{source}workflow spec is missing schema {schema!r}")
-    for prompt in ("scope", "search", "fetch", "dedup", "verify", "synthesize", "critic"):
+    for prompt in required_prompts:
         if prompt not in spec["prompts"]:
             raise WorkflowError(f"{source}workflow spec is missing prompt {prompt!r}")
 
@@ -233,6 +244,46 @@ def project_usage(spec: dict[str, Any], *, question: str, tier: str, engine: str
     projection_tier = _projected_tier(question, tier)
     cfg = spec["tiers"][projection_tier]
     estimates = spec.get("token_estimates", {})
+    runner = str(spec.get("runner") or spec.get("id"))
+    if runner == "agent-team":
+        calls_by_phase = {
+            "scope": 1,
+            "collect": int(cfg["collectors"]),
+            "shard": 1,
+            "execute": int(cfg["workers"]),
+            "verify": int(cfg["verifiers"]),
+            "integrate": 1,
+        }
+        input_tokens, output_tokens = _project_tokens(estimates, calls_by_phase)
+        engine_overhead = (spec.get("engine_token_overhead") or {}).get(engine, {})
+        call_count = sum(calls_by_phase.values())
+        input_tokens += int(engine_overhead.get("input_per_call", 0)) * call_count
+        maximum_estimates = {
+            phase: {
+                "input": estimate.get("max_input", estimate.get("input", 0)),
+                "output": estimate.get("max_output", estimate.get("output", 0)),
+            }
+            for phase, estimate in estimates.items()
+        }
+        max_input_tokens, max_output_tokens = _project_tokens(maximum_estimates, calls_by_phase)
+        max_input_tokens += int(engine_overhead.get("max_input_per_call", engine_overhead.get("input_per_call", 0))) * call_count
+        return {
+            "tier_basis": projection_tier,
+            "calls": sum(calls_by_phase.values()),
+            "max_calls": sum(calls_by_phase.values()),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "max_input_tokens": max_input_tokens,
+            "max_output_tokens": max_output_tokens,
+            "max_total_tokens": max_input_tokens + max_output_tokens,
+            "cost_usd": _cost_usd(input_tokens, output_tokens, pricing),
+            "max_cost_usd": _cost_usd(max_input_tokens, max_output_tokens, pricing),
+            "calls_by_phase": calls_by_phase,
+            "max_calls_by_phase": dict(calls_by_phase),
+            "budget_usd": _first_float(budget_usd),
+            "budget_scope": "per_call_engine_limit",
+        }
     claims = int(cfg["claims"])
     angles = int(cfg["angles"])
     fetches = int(cfg["fetch"])
@@ -295,6 +346,8 @@ def summarize_actual_usage(records: list[dict[str, Any]], pricing: dict[str, Any
         }
     input_tokens = sum(int(record.get("input_tokens") or 0) for record in known)
     output_tokens = sum(int(record.get("output_tokens") or 0) for record in known)
+    provider_costs = [record.get("cost_usd") for record in known]
+    provider_cost_available = bool(known) and all(value is not None for value in provider_costs)
     return {
         "calls": len(records),
         "metered_calls": len(known),
@@ -302,7 +355,8 @@ def summarize_actual_usage(records: list[dict[str, Any]], pricing: dict[str, Any
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
-        "cost_usd": _cost_usd(input_tokens, output_tokens, pricing),
+        "cost_usd": round(sum(float(value) for value in provider_costs), 6) if provider_cost_available else _cost_usd(input_tokens, output_tokens, pricing),
+        "cost_source": "provider" if provider_cost_available else "pricing_estimate",
         "records": records,
     }
 
@@ -350,7 +404,11 @@ def format_usage_block(usage: dict[str, Any]) -> str:
         f"~{_display_tokens(projected.get('output_tokens'))} output "
         f"(max {_display_tokens(projected.get('max_input_tokens'))} / {_display_tokens(projected.get('max_output_tokens'))})",
         f"- Cost: ~{_display_money(projected.get('cost_usd'))} (max {_display_money(projected.get('max_cost_usd'))})",
-        f"- Budget cap: {_display_money(projected.get('budget_usd'))}",
+        (
+            f"- Per-call engine budget limit: {_display_money(projected.get('budget_usd'))} (total run cost can exceed this)"
+            if projected.get("budget_scope") == "per_call_engine_limit"
+            else f"- Budget cap: {_display_money(projected.get('budget_usd'))}"
+        ),
         "",
         "Actual usage:",
     ]
@@ -361,8 +419,9 @@ def format_usage_block(usage: dict[str, Any]) -> str:
         lines.extend(
             [
                 f"- Calls: {actual.get('calls', 0)}",
-                f"- Tokens: {_display_tokens(actual.get('input_tokens'))} input / {_display_tokens(actual.get('output_tokens'))} output",
+                f"- Tokens: {_display_tokens(actual.get('input_tokens'))} input/cache / {_display_tokens(actual.get('output_tokens'))} output",
                 f"- Cost: {_display_money(actual.get('cost_usd'))}",
+                f"- Cost source: {actual.get('cost_source', 'pricing_estimate')}",
                 f"- Delta vs projected: {_display_money(delta)}" if delta is not None else "- Delta vs projected: unavailable",
             ]
         )
@@ -474,12 +533,17 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
 
 def _unwrap_json_response(parsed: dict[str, Any]) -> dict[str, Any]:
+    wrapper_usage = dict(parsed["usage"]) if isinstance(parsed.get("usage"), dict) else None
+    if wrapper_usage is not None and parsed.get("total_cost_usd") is not None:
+        wrapper_usage["cost_usd"] = parsed["total_cost_usd"]
     for key in ("structured_output", "result", "response", "message", "content"):
         value = parsed.get(key)
         if isinstance(value, str):
             try:
                 nested = json.loads(value)
                 if isinstance(nested, dict):
+                    if wrapper_usage:
+                        nested["_usage"] = wrapper_usage
                     return nested
             except json.JSONDecodeError:
                 try:
@@ -487,7 +551,10 @@ def _unwrap_json_response(parsed: dict[str, Any]) -> dict[str, Any]:
                 except WorkflowError:
                     pass
         if isinstance(value, dict):
-            return value
+            nested = dict(value)
+            if wrapper_usage:
+                nested["_usage"] = wrapper_usage
+            return nested
     return parsed
 
 
@@ -513,6 +580,8 @@ class ExternalEngineAdapter(EngineAdapter):
         run_dir: Path,
         model: str | None = None,
         budget_usd: str = "0.50",
+        allowed_tools: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> None:
         self.engine = engine
         self.command = command
@@ -520,7 +589,8 @@ class ExternalEngineAdapter(EngineAdapter):
         self.run_dir = run_dir
         self.model = model
         self.budget_usd = budget_usd
-        self.timeout_seconds = int(_first_float(os.environ.get("AGENT_WORKFLOW_CALL_TIMEOUT_SECONDS"), 180))
+        self.allowed_tools = allowed_tools
+        self.timeout_seconds = int(_first_float(os.environ.get("AGENT_WORKFLOW_CALL_TIMEOUT_SECONDS"), timeout_seconds, 180))
         self._lock = threading.Lock()
         self._index = 0
 
@@ -534,17 +604,20 @@ class ExternalEngineAdapter(EngineAdapter):
         prompt_path.write_text(call.prompt, encoding="utf-8")
         cmd = self._command(call.prompt, schema_path, response_path)
         (call_dir / "command.txt").write_text(shlex.join(cmd) + "\n", encoding="utf-8")
+        run_kwargs: dict[str, Any] = {
+            "cwd": str(self.project_dir),
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "check": False,
+            "timeout": self.timeout_seconds,
+        }
+        if self.engine == "claude":
+            run_kwargs["input"] = call.prompt
+        else:
+            run_kwargs["stdin"] = subprocess.DEVNULL
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(self.project_dir),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-                timeout=self.timeout_seconds,
-            )
+            proc = subprocess.run(cmd, **run_kwargs)
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout or ""
             if isinstance(stdout, bytes):
@@ -594,13 +667,14 @@ class ExternalEngineAdapter(EngineAdapter):
             cmd = [
                 self.command,
                 "-p",
-                prompt,
+                "--input-format",
+                "text",
                 "--add-dir",
                 str(self.project_dir),
                 "--permission-mode",
                 "auto",
                 "--allowedTools",
-                "WebSearch,WebFetch",
+                self.allowed_tools or "WebSearch,WebFetch",
                 "--json-schema",
                 schema_path.read_text(encoding="utf-8"),
                 "--output-format",
@@ -623,6 +697,131 @@ class FakeEngineAdapter(EngineAdapter):
     def call(self, call: ModelCall) -> dict[str, Any]:
         self.calls.append(call)
         label = call.label
+        if label == "team-scope":
+            return {
+                "objective": "fixture team objective",
+                "profile": "shallow",
+                "teamFit": True,
+                "fitReason": "Two independent fixture authorities and packets are available.",
+                "mode": "audit",
+                "authorities": [
+                    {
+                        "id": "source-a",
+                        "label": "Fixture source A",
+                        "sourceKind": "files",
+                        "task": "Collect fixture A.",
+                        "authoritativeCommands": ["read fixture A"],
+                        "outputContract": "Return fixture A facts.",
+                    },
+                    {
+                        "id": "source-b",
+                        "label": "Fixture source B",
+                        "sourceKind": "git",
+                        "task": "Collect fixture B.",
+                        "authoritativeCommands": ["git status --short"],
+                        "outputContract": "Return fixture B facts.",
+                    },
+                ],
+                "suggestedShards": ["Analyze A", "Analyze B"],
+                "successCriteria": ["Both sources are covered."],
+                "singleAgentEstimate": {"wallTimeSeconds": 120, "totalTokens": 12000, "basis": "Fixture estimate."},
+            }
+        if label.startswith("collector:"):
+            authority_id = label.split(":", 1)[1]
+            return {
+                "authorityId": authority_id,
+                "sourceStatus": "verified",
+                "authoritative": True,
+                "capturedAt": "2026-01-01T00:00:00Z",
+                "summary": f"Collected {authority_id}.",
+                "facts": [
+                    {
+                        "statement": f"{authority_id} fixture fact.",
+                        "evidence": "Fixture evidence.",
+                        "locator": authority_id,
+                        "confidence": "high",
+                    }
+                ],
+                "commands": [{"command": "fixture read", "outcome": "success"}],
+                "artifacts": [],
+                "limitations": [],
+            }
+        if label == "team-shard":
+            return {
+                "workPackets": [
+                    {
+                        "id": "packet-a",
+                        "title": "Analyze A",
+                        "objective": "Analyze source A.",
+                        "authorityIds": ["source-a"],
+                        "scopeBoundary": "Source A only.",
+                        "deliverable": "A finding.",
+                        "verification": "Check source A snapshot.",
+                        "dependsOn": [],
+                    },
+                    {
+                        "id": "packet-b",
+                        "title": "Analyze B",
+                        "objective": "Analyze source B.",
+                        "authorityIds": ["source-b"],
+                        "scopeBoundary": "Source B only.",
+                        "deliverable": "B finding.",
+                        "verification": "Check source B snapshot.",
+                        "dependsOn": [],
+                    },
+                ],
+                "integrationRisks": ["Fixture mismatch risk."],
+            }
+        if label.startswith("worker:"):
+            packet_id = label.split(":", 1)[1]
+            return {
+                "packetId": packet_id,
+                "status": "complete",
+                "summary": f"Completed {packet_id}.",
+                "findings": [
+                    {
+                        "statement": f"{packet_id} fixture finding.",
+                        "evidence": "Fixture snapshot.",
+                        "sourceRefs": [packet_id.replace("packet", "source")],
+                        "confidence": "high",
+                    }
+                ],
+                "checks": ["Fixture check passed."],
+                "artifacts": [],
+                "uncertainties": [],
+                "efficiencyNote": "Packet stayed within scope.",
+            }
+        if label.startswith("verifier:"):
+            return {
+                "verdict": "pass",
+                "summary": "Fixture packets agree with the snapshots.",
+                "validatedPacketIds": ["packet-a", "packet-b"],
+                "contradictions": [],
+                "gaps": [],
+                "rerunCommands": [],
+                "confidence": "high",
+            }
+        if label == "team-integrate":
+            return {
+                "summary": "Fixture team summary.",
+                "findings": [
+                    {
+                        "claim": "Both fixture packets completed.",
+                        "confidence": "high",
+                        "sources": ["source-a", "source-b"],
+                        "evidence": "The verifier passed both packets.",
+                    }
+                ],
+                "caveats": "Fixture caveat.",
+                "open_questions": [],
+                "recommended_actions": ["Use the integrated fixture result."],
+                "quality": {
+                    "coverage": "complete",
+                    "accuracy": "high",
+                    "consistency": "high",
+                    "verificationSummary": "All fixture packets verified.",
+                },
+            }
         if label == "scope":
             return {
                 "question": "fixture question",
@@ -771,6 +970,7 @@ class OptimizingEngineAdapter(EngineAdapter):
             "model": self.engine,
             "provider": self.engine,
             "route": "cache" if cached else "standard",
+            "cost_usd": usage.get("cost_usd"),
         }
 
 
@@ -778,8 +978,16 @@ def _response_usage(response: dict[str, Any]) -> dict[str, Any]:
     for key in ("_usage", "usage"):
         value = response.get(key)
         if isinstance(value, dict):
-            parsed = parse_usage_metadata({"usage": value})
-            return parsed if parsed else value
+            parsed = parse_usage_metadata({"usage": value}) or dict(value)
+            cache_creation = int(value.get("cache_creation_input_tokens") or 0)
+            cache_read = int(value.get("cache_read_input_tokens") or 0)
+            if cache_creation or cache_read:
+                parsed["input_tokens"] = int(value.get("input_tokens") or 0) + cache_creation + cache_read
+                parsed["cache_creation_tokens"] = cache_creation
+                parsed["cached_tokens"] = cache_read
+            if value.get("cost_usd") is not None:
+                parsed["cost_usd"] = float(value["cost_usd"])
+            return parsed
     return {}
 
 
@@ -791,6 +999,8 @@ def create_engine_adapter(
     run_dir: Path,
     model: str | None = None,
     budget_usd: str = "0.50",
+    allowed_tools: str | None = None,
+    timeout_seconds: int | None = None,
 ) -> EngineAdapter:
     if engine not in agents:
         raise WorkflowError(f"engine {engine!r} is not configured in agents.json")
@@ -803,6 +1013,8 @@ def create_engine_adapter(
         run_dir=run_dir,
         model=model,
         budget_usd=budget_usd,
+        allowed_tools=allowed_tools,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -899,7 +1111,8 @@ def run_workflow(
     adapter: EngineAdapter | None = None,
 ) -> dict[str, Any]:
     spec = load_workflow(workflow_id)
-    if spec["id"] != DEFAULT_WORKFLOW_ID:
+    runner = str(spec.get("runner") or spec["id"])
+    if runner not in SUPPORTED_WORKFLOW_RUNNERS:
         raise WorkflowError(f"workflow {workflow_id!r} is registered but has no runner yet")
     if tier not in {"auto", "shallow", "standard", "deep"}:
         raise WorkflowError("--tier must be auto, shallow, standard, or deep")
@@ -907,7 +1120,7 @@ def run_workflow(
         raise WorkflowError("--format must be both, text, or json")
     question = question.strip()
     if not question:
-        raise WorkflowError("a research question is required")
+        raise WorkflowError("a workflow task is required")
 
     project_dir = (project_dir or Path.cwd()).resolve()
     run_meta = ensure_run_meta(meta)
@@ -919,6 +1132,7 @@ def run_workflow(
     usage = build_usage(spec, question=question, tier=tier, engine=resolved_engine, budget_usd=budget_usd, pricing=pricing)
     manifest = {
         "workflow_id": spec["id"],
+        "runner": runner,
         "name": spec["name"],
         "run_id": run_id,
         "engine": resolved_engine,
@@ -959,6 +1173,8 @@ def run_workflow(
             run_dir=run_dir,
             model=model,
             budget_usd=budget_usd,
+            allowed_tools="Read,Grep,Glob,WebSearch,WebFetch" if runner == "agent-team" and resolved_engine == "claude" else None,
+            timeout_seconds=300 if runner == "agent-team" else None,
         )
     optimizing_adapter = OptimizingEngineAdapter(
         adapter,
@@ -970,23 +1186,46 @@ def run_workflow(
     )
 
     try:
-        result = _run_deep_research_lite(
-            spec,
-            question,
-            tier,
-            optimizing_adapter,
-            run_dir,
-            concurrency,
-            run_meta,
-            compression_mode=compression_mode,
-            compression_max_chars=compression_max_chars,
-            compression_command=compression_command,
-        )
+        if runner == "agent-team":
+            result = run_agent_team(
+                spec=spec,
+                raw_task=question,
+                tier_arg=tier,
+                adapter=optimizing_adapter,
+                run_dir=run_dir,
+                project_dir=project_dir,
+                concurrency=concurrency,
+                run_meta=run_meta,
+                call_model=_call,
+                parallel_map=parallel_map,
+                emit_phase=_phase,
+            )
+        else:
+            result = _run_deep_research_lite(
+                spec,
+                question,
+                tier,
+                optimizing_adapter,
+                run_dir,
+                concurrency,
+                run_meta,
+                compression_mode=compression_mode,
+                compression_max_chars=compression_max_chars,
+                compression_command=compression_command,
+            )
     except Exception as exc:
         emit_event("workflow.failed", run_id=run_id, meta=run_meta, data={"error": str(exc)})
         raise
 
-    result.update({"workflow_id": spec["id"], "run_id": run_id, "engine": resolved_engine})
+    result.update(
+        {
+            "workflow_id": spec["id"],
+            "workflow_name": spec["name"],
+            "run_id": run_id,
+            "engine": resolved_engine,
+            "artifact_dir": str(run_dir),
+        }
+    )
     compression_usage_records = [
         {
             "phase": "Fetch",
@@ -1005,6 +1244,15 @@ def run_workflow(
     actual_usage = summarize_actual_usage(usage_records, pricing)
     usage = build_usage(spec, question=question, tier=result.get("tier", tier), engine=resolved_engine, budget_usd=budget_usd, pricing=pricing, actual=actual_usage)
     result["usage"] = usage
+    if result.get("team"):
+        team = result["team"]
+        projected_tokens = int(usage.get("projected", {}).get("total_tokens") or 0)
+        actual_tokens = usage.get("actual", {}).get("total_tokens")
+        baseline_tokens = int((team.get("singleAgentEstimate") or {}).get("totalTokens") or 0)
+        team["projectedTokens"] = projected_tokens
+        team["actualTokens"] = actual_tokens
+        team["projectedTokenMultiple"] = round(projected_tokens / baseline_tokens, 2) if baseline_tokens else None
+        team["baselineBasis"] = str((team.get("singleAgentEstimate") or {}).get("basis") or "Agent-generated estimate; no direct single-agent control run was measured.")
     report = format_report(result)
     report_path = run_dir / "report.md"
     result_path = run_dir / "result.json"
@@ -1029,6 +1277,7 @@ def run_workflow(
         "result": str(result_path),
         "usage": str(run_dir / "usage.json"),
         "events": str(events_path()),
+        **(result.get("artifacts") or {}),
     }
     write_json(run_dir / "manifest.json", manifest)
     emit_event("workflow.completed", run_id=run_id, meta=run_meta, data={"result": str(result_path), "report": str(report_path)})
@@ -1504,12 +1753,16 @@ def _empty_result(
 
 
 def format_report(result: dict[str, Any]) -> str:
+    title = result.get("workflow_name")
+    if not title:
+        title = "Deep Research Lite" if result.get("workflow_id") == "deep-research-lite" else result.get("workflow_id") or "Workflow Report"
     lines = [
-        "# Deep Research Lite",
+        f"# {title}",
         "",
         f"Question: {result.get('question', '')}",
         f"Engine: {result.get('engine', '')}",
         f"Tier: {result.get('tier', '')}",
+        f"Status: {result.get('status', 'unknown')}",
         f"Run: {result.get('run_id', '')}",
         "",
         "## Summary",
@@ -1537,6 +1790,49 @@ def format_report(result: dict[str, Any]) -> str:
     if open_questions:
         lines.extend(["", "## Open Questions"])
         lines.extend(f"- {question}" for question in open_questions)
+    recommended_actions = result.get("recommended_actions") or []
+    if recommended_actions:
+        lines.extend(["", "## Recommended Actions"])
+        lines.extend(f"- {action}" for action in recommended_actions)
+    verification = result.get("verification") or []
+    if verification:
+        lines.extend(["", "## Independent Verification"])
+        for index, verifier in enumerate(verification, start=1):
+            lines.append(f"- Verifier {index}: {verifier.get('verdict', 'unknown')} ({verifier.get('confidence', 'unknown')} confidence) — {verifier.get('summary', '')}")
+            for contradiction in verifier.get("contradictions") or []:
+                lines.append(f"  - Contradiction: {contradiction.get('description', '')} Resolution: {contradiction.get('resolution', '')}")
+            for gap in verifier.get("gaps") or []:
+                lines.append(f"  - Gap: {gap}")
+            for command in verifier.get("rerunCommands") or []:
+                lines.append(f"  - Suggested recheck: {command}")
+    team = result.get("team") or {}
+    if team:
+        timings = team.get("timingsSeconds") or {}
+        lines.extend(
+            [
+                "",
+                "## Team Performance",
+                f"- Protocol: {team.get('protocol', 'Snapshot-Shard-Verify')}",
+                f"- Team: {team.get('collectors', 0)} collector(s), {team.get('workers', 0)} worker(s), {team.get('verifiers', 0)} verifier(s)",
+                f"- Concurrency: {team.get('concurrency', 0)}",
+                f"- Wall time: {timings.get('total', 'unavailable')} seconds",
+                f"- Actual tokens: {team.get('actualTokens') if team.get('actualTokens') is not None else 'provider metadata unavailable'}",
+                f"- Agent-estimated single-agent baseline: {(team.get('singleAgentEstimate') or {}).get('wallTimeSeconds', 'unavailable')} seconds / {(team.get('singleAgentEstimate') or {}).get('totalTokens', 'unavailable')} tokens",
+                f"- Baseline basis: {team.get('baselineBasis', 'Agent-generated estimate; no direct control run was measured.')}",
+                f"- Derived speedup vs agent estimate (not measured): {team.get('estimatedSpeedup') if team.get('estimatedSpeedup') is not None else 'unavailable'}x",
+                f"- Projected token multiple vs agent estimate: {team.get('projectedTokenMultiple') if team.get('projectedTokenMultiple') is not None else 'unavailable'}x",
+            ]
+        )
+        quality = result.get("quality") or {}
+        if quality:
+            lines.extend(
+                [
+                    f"- Coverage: {quality.get('coverage', 'unknown')}",
+                    f"- Accuracy: {quality.get('accuracy', 'unknown')}",
+                    f"- Consistency: {quality.get('consistency', 'unknown')}",
+                    f"- Verification: {quality.get('verificationSummary', '')}",
+                ]
+            )
     optimization = result.get("optimization") or {}
     compression = optimization.get("compression") or []
     lines.extend(
@@ -1564,6 +1860,8 @@ def format_report(result: dict[str, Any]) -> str:
             f"- events: {events_path()}",
         ]
     )
+    for name, path in (result.get("artifacts") or {}).items():
+        lines.append(f"- {name}: {path}")
     return "\n".join(lines).rstrip() + "\n"
 
 

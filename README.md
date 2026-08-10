@@ -135,13 +135,37 @@ Run a portable workflow:
 agent workflow list
 agent workflow run deep-research-lite --engine codex --tier shallow \
   --question "What changed in Python 3.13?"
+agent workflow run agent-team --engine claude --tier standard \
+  --question "Audit independent local implementation and test evidence."
 ```
+
+`agent-team` uses Snapshot-Shard-Verify as a mnemonic for six executable phases: Scope, Collect
+(Snapshot), Shard, Execute, Verify, and Integrate. Authoritative collectors freeze evidence,
+independent workers execute non-overlapping packets concurrently, a separate verifier checks the
+collated packet results, and the integrator produces one result with a clearly labeled baseline
+comparison. The portable runner is read-only; implementation work should use isolated worktrees and
+bounded `agent code bridge --mode code` builders instead. Claude teams receive only
+`Read,Grep,Glob,WebSearch,WebFetch`; Git, private GitHub, and CI state should be captured once by
+the calling coordinator, or run through Codex only after read-only shell readiness succeeds.
 
 Inspect recent native-session evidence without importing raw chat history:
 
 ```bash
 agent code sessions inventory --since-hours 168
 ```
+
+Publish append-aware Codex session deltas, preview an additive cross-machine merge, and inspect
+sync health:
+
+```bash
+agent code state-sync publish
+agent code state-sync apply --dry-run
+agent code state-sync status
+```
+
+An actual import requires Codex Desktop to be closed and creates a native metadata backup first.
+See [Codex incremental state sync](docs/codex-incremental-state-sync.md) for path mapping,
+scheduler, privacy, conflict, and rollback behavior.
 
 Agent Bridge targets the current Git root by default. Use `--project-dir /absolute/path` to target a
 different checkout.
@@ -156,6 +180,8 @@ different checkout.
   generated harness context.
 - [Active session recovery](docs/active-session-recovery.md) documents bounded continuation
   handoffs.
+- [Codex incremental state sync](docs/codex-incremental-state-sync.md) documents additive Mac and
+  Windows session continuity without replacing target-only state.
 
 Agent Bridge is a local-first control plane, not a local-inference guarantee. Prompts sent to a
 vendor CLI may still be transmitted under that tool's own account, privacy, and retention terms.

@@ -697,7 +697,17 @@ class BridgeCliTests(unittest.TestCase):
                 "AGENT_BRIDGE_DISABLE_AUTO_UPDATE": "1",
             }
             proc = subprocess.run(
-                [str(AGENT), "code", "hook", "session-start", "--client", "codex", "--surface", "cli"],
+                [
+                    str(AGENT),
+                    "code",
+                    "hook",
+                    "session-start",
+                    "--client",
+                    "codex",
+                    "--surface",
+                    "cli",
+                    "--skip-pointer-sync",
+                ],
                 cwd=str(ROOT),
                 env=env,
                 text=True,
@@ -801,7 +811,9 @@ class BridgeCliTests(unittest.TestCase):
         with mock.patch.object(bridge_cli, "update_bridge", return_value=update):
             with mock.patch.object(bridge_cli.os, "execve", side_effect=RuntimeError("reexec")) as execute:
                 with self.assertRaisesRegex(RuntimeError, "reexec"):
-                    bridge_cli.hook_session_start(["--client", "codex", "--surface", "cli"])
+                    bridge_cli.hook_session_start(
+                        ["--client", "codex", "--surface", "cli", "--skip-pointer-sync"]
+                    )
         command = execute.call_args.args[1]
         environment = execute.call_args.args[2]
         self.assertIn("--skip-update", command)

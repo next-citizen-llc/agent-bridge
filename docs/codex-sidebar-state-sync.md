@@ -1,10 +1,23 @@
-# Codex Sidebar State Sync
+# Legacy Full Codex Sidebar Bundle
+
+> Warning: this is a destructive, full native-store migration tool. Do not use
+> it to synchronize Windows, WSL/Linux, and macOS. Absolute workspace paths and
+> native UI/database assumptions are not portable across those runtimes. Use
+> [`codex-pointer-sync.md`](codex-pointer-sync.md) for routine cross-runtime
+> project and recent-task visibility.
 
 This runbook copies the Codex Desktop state that controls visible sessions and
 workspace groupings in the sidebar from one machine to another.
 
-Use it when a second machine should show the same Codex sessions and the same
-workspace/project entries as the source machine.
+Use it only for explicit same-platform disaster recovery when the target should
+be replaced by the source native store. It is not an always-on sync layer.
+New exports record their platform, and imports refuse a platform mismatch by
+default. The override exists only for explicit disaster recovery and does not
+make foreign absolute paths portable.
+
+Imports also refuse to run while Codex writer processes are active. Close Codex
+first, or use the same-platform restart option from a separate terminal so the
+script can stop and re-check those writers before replacing native state.
 
 ## What Gets Synced
 
@@ -110,20 +123,11 @@ copied state is in place. On Windows, `-Restart` stops a running `Codex` process
 before import and starts `Codex.exe` afterward when it can resolve the install
 path; if it cannot, start Codex Desktop manually after the import.
 
-## Common Directional Flows
+## Cross-Platform Use
 
-To push this Mac's Codex conversations and workspaces to the Windows Desktop:
-
-1. Export on the Mac into `SharedAgentData/CodexSidebarSync`.
-2. Wait for OneDrive to finish syncing the bundle to Windows.
-3. On `DESKTOP-785F6GB`, import that bundle with the Windows target command.
-
-To pull the Windows Desktop's Codex conversations and workspaces back to this
-Mac:
-
-1. Export on `DESKTOP-785F6GB` with the Windows source command.
-2. Wait for OneDrive to finish syncing the bundle to this Mac.
-3. Import that bundle on the Mac with the macOS target command.
+Do not import these bundles across operating systems. Keep each native Codex
+store authoritative for its runtime and exchange only pointer metadata through
+`agent code pointer-sync`.
 
 ## Target Backup and Rollback
 

@@ -80,7 +80,16 @@ class SkillRetirementTests(unittest.TestCase):
             redirect_stdout(io.StringIO()) as output,
         ):
             result = cli.hook_session_start(
-                ["--client", "codex", "--surface", "cli", "--skip-update", "--skip-managed-repos", "--plain"]
+                [
+                    "--client",
+                    "codex",
+                    "--surface",
+                    "cli",
+                    "--skip-update",
+                    "--skip-managed-repos",
+                    "--skip-pointer-sync",
+                    "--plain",
+                ]
             )
         self.assertEqual(result, 0)
         retire.assert_called_once_with()

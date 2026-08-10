@@ -7,7 +7,8 @@ param(
     [string]$From,
     [switch]$Yes,
     [switch]$RefreshSidebar,
-    [switch]$Restart
+    [switch]$Restart,
+    [switch]$AllowPlatformMismatch
 )
 
 $ErrorActionPreference = "Stop"
@@ -159,6 +160,7 @@ function Write-Manifest {
         mode = $ModeName
         created_at = (Get-UtcStamp)
         hostname = (Get-HostNameText)
+        platform = "windows"
         source_codex_home = $CodexHomePath
     }
     $manifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $Bundle "manifest.json") -Encoding UTF8
@@ -267,11 +269,23 @@ function Refresh-SidebarState {
     Write-Host "Refreshed on-disk sidebar state and wrote marker: $markerDir\last-refresh.json"
 }
 
+function Get-CodexWriterProcesses {
+    return @(
+        Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessName -in @("ChatGPT", "Codex", "codex", "codex-code-mode-host")
+        }
+    )
+}
+
 function Stop-CodexDesktop {
-    $processes = Get-Process -Name "Codex" -ErrorAction SilentlyContinue
+    $processes = Get-CodexWriterProcesses
     if ($processes) {
         $processes | Stop-Process -Force
         Start-Sleep -Seconds 2
+        $remaining = Get-CodexWriterProcesses
+        if ($remaining) {
+            Fail "Codex writer processes are still active: $($remaining.Id -join ', ')"
+        }
         Write-Host "Stopped Codex Desktop."
     }
 }
@@ -304,13 +318,35 @@ function Import-Bundle {
         [string]$CodexHomePath,
         [string]$Bundle,
         [bool]$DoRefresh,
-        [bool]$DoRestart
+        [bool]$DoRestart,
+        [bool]$DoAllowPlatformMismatch
     )
     if (-not (Test-Path -LiteralPath $Bundle -PathType Container)) {
         Fail "bundle directory not found: $Bundle"
     }
     if (-not (Test-Path -LiteralPath (Join-Path $Bundle "manifest.json") -PathType Leaf)) {
         Fail "bundle manifest not found: $Bundle\manifest.json"
+    }
+    $manifest = Get-Content -LiteralPath (Join-Path $Bundle "manifest.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([string]$manifest.kind -ne "codex_sidebar_state_bundle") {
+        Fail "unrecognized bundle manifest kind: $($manifest.kind)"
+    }
+    $sourcePlatform = [string]$manifest.platform
+    if (-not $sourcePlatform) {
+        $sourceHome = [string]$manifest.source_codex_home
+        if ($sourceHome -match '^/') {
+            $sourcePlatform = if ($sourceHome -match '^/Users/') { "macos" } else { "linux" }
+        }
+        elseif ($sourceHome -match '^[A-Za-z]:[\\/]' -or $sourceHome -match '^\\\\') {
+            $sourcePlatform = "windows"
+        }
+    }
+    if ($sourcePlatform -and $sourcePlatform -ne "windows" -and -not $DoAllowPlatformMismatch) {
+        Fail "refusing $sourcePlatform bundle import into Windows; use Agent Bridge pointer-sync instead (or pass -AllowPlatformMismatch for explicit disaster recovery)"
+    }
+    $writers = Get-CodexWriterProcesses
+    if ($writers -and -not $DoRestart) {
+        Fail "close Codex before import, or pass -Restart to stop detected writer processes"
     }
     if ($DoRestart) {
         Stop-CodexDesktop
@@ -357,6 +393,6 @@ switch ($Mode) {
     "import" {
         if (-not $From) { Fail "import requires -From DIR" }
         if (-not $Yes) { Fail "import overwrites target state; pass -Yes after reviewing the bundle" }
-        Import-Bundle -CodexHomePath $CodexHome -Bundle (Expand-LocalPath $From) -DoRefresh ([bool]$RefreshSidebar) -DoRestart ([bool]$Restart)
+        Import-Bundle -CodexHomePath $CodexHome -Bundle (Expand-LocalPath $From) -DoRefresh ([bool]$RefreshSidebar) -DoRestart ([bool]$Restart) -DoAllowPlatformMismatch ([bool]$AllowPlatformMismatch)
     }
 }

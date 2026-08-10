@@ -687,7 +687,7 @@ class StateSyncTests(unittest.TestCase):
             root = Path(tmp)
             home = root / "codex"
             self._create_db(home, [])
-            state = home / ".codex-global-state.json"
+            state = (home / ".codex-global-state.json").resolve()
             state.write_text("{}", encoding="utf-8")
             shared = root / "SharedAgentData"
             machine_root = shared / "AgentBridgeStateSync" / "v1" / "machines" / "source-machine" / "codex"

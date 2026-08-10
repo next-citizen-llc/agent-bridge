@@ -22,6 +22,7 @@ from agent_bridge.state_sync import (
     _install_artifact,
     _macos_plist,
     _merge_session_index,
+    _normalize_git_remote,
     _pid_is_running,
     _powershell_literal,
     _publisher_lock,
@@ -596,6 +597,124 @@ class StateSyncTests(unittest.TestCase):
                 with self.assertRaisesRegex(StateSyncError, "could not read native Codex state"):
                     _read_native_json_object(state)
             self.assertEqual(state.read_text(encoding="utf-8"), '{"keep": true}')
+
+    def test_git_remote_normalization_is_private_and_portable(self) -> None:
+        self.assertEqual(_normalize_git_remote("git@github.com:Example/Demo.git"), "example/demo")
+        self.assertEqual(_normalize_git_remote("https://github.com/Example/Demo.git"), "example/demo")
+        self.assertEqual(_normalize_git_remote("https://example.org/repo.git"), "example.org/repo")
+        self.assertEqual(_normalize_git_remote("git@example.org:repo.git"), "example.org/repo")
+        self.assertEqual(
+            _normalize_git_remote("https://user:token@gitlab.com/Group/Repo.git?secret=yes#fragment"),
+            "gitlab.com/group/repo",
+        )
+        self.assertEqual(_normalize_git_remote("ssh://alice@example.org/Org/Repo.git/"), "example.org/org/repo")
+        self.assertEqual(_normalize_git_remote("git+ssh://alice@example.org/Org/Repo.git"), "example.org/org/repo")
+        self.assertEqual(_normalize_git_remote("ssh+git://alice@example.org/Org/Repo.git"), "example.org/org/repo")
+        self.assertEqual(_normalize_git_remote("https://example.org:8443/Org/Repo.git"), "example.org/org/repo")
+        self.assertEqual(_normalize_git_remote("https://example.org/Org/Repo%20Name.git"), "example.org/org/repo%20name")
+        self.assertEqual(_normalize_git_remote("https://www.github.com/Example/Demo.git"), "example/demo")
+        self.assertEqual(_normalize_git_remote("ssh://git@ssh.github.com:443/Example/Demo.git"), "example/demo")
+        self.assertEqual(_normalize_git_remote("git@github.com.:Example/Demo.git"), "example/demo")
+        self.assertEqual(_normalize_git_remote("https://github.com./Example/Demo.git"), "example/demo")
+        self.assertEqual(_normalize_git_remote("https://www.github.com./Example/Demo.git"), "example/demo")
+        self.assertEqual(_normalize_git_remote("ssh://git@ssh.github.com.:443/Example/Demo.git"), "example/demo")
+        self.assertEqual(_normalize_git_remote("https://example.org./repo.git"), "example.org/repo")
+        self.assertEqual(_normalize_git_remote("https://evilgithub.com/Example/Demo.git"), "evilgithub.com/example/demo")
+        self.assertEqual(
+            _normalize_git_remote("https://github.company.com/Example/Demo.git"),
+            "github.company.com/example/demo",
+        )
+        self.assertEqual(
+            _normalize_git_remote("git@example.org:Org/Repo.git?secret=yes#fragment"),
+            "example.org/org/repo",
+        )
+        for remote in (
+            "file:///private/demo.git",
+            "/private/demo.git",
+            r"C:\private\demo.git",
+            "C:relative/repo.git",
+            "z:relative/repo.git",
+            r"\\server\share\demo.git",
+            "../private/demo.git",
+            "not-a-network-remote",
+            "https://example.org/",
+            "git@example.org:",
+            "https://[malformed/repo/name.git",
+            "https://example.org/Org/Repo name.git",
+            "https://example.org/Org/Repo\u2003name.git",
+            "https://example.org/Org/Repo.git\tignored",
+            "https://example.org/Org/Repo.git\x00ignored",
+            "https://example.org/Org/Repo.git\x7fignored",
+            "https://example.org:invalid/Org/Repo.git",
+            "https://example.org:65536/Org/Repo.git",
+            "https://github.com../Example/Demo.git",
+            "https://www.github.com../Example/Demo.git",
+            "ssh://git@ssh.github.com../Example/Demo.git",
+            "https://.github.com/Example/Demo.git",
+            "https://example..org/Org/Repo.git",
+        ):
+            with self.subTest(remote=remote):
+                self.assertEqual(_normalize_git_remote(remote), "")
+
+    def test_publish_invalid_native_state_preserves_shared_metadata(self) -> None:
+        for invalid in ("{invalid", "[]"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                home = root / "codex"
+                self._create_db(home, [])
+                (home / ".codex-global-state.json").write_text(invalid, encoding="utf-8")
+                shared = root / "SharedAgentData"
+                machine_root = shared / "AgentBridgeStateSync" / "v1" / "machines" / "source-machine" / "codex"
+                machine_root.mkdir(parents=True)
+                sentinels = {
+                    machine_root / "project-index.jsonl": b"project sentinel\n",
+                    machine_root / "ui-state.json": b"ui sentinel\n",
+                    machine_root / "manifest.json": b"manifest sentinel\n",
+                }
+                for path, body in sentinels.items():
+                    path.write_bytes(body)
+                with self.assertRaises(StateSyncError):
+                    publish_codex_state(
+                        codex_home=home,
+                        shared_root=shared,
+                        machine_id="source-machine",
+                        settle_seconds=0,
+                    )
+                self.assertEqual({path: path.read_bytes() for path in sentinels}, sentinels)
+
+    def test_publish_native_state_permission_error_preserves_shared_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "codex"
+            self._create_db(home, [])
+            state = home / ".codex-global-state.json"
+            state.write_text("{}", encoding="utf-8")
+            shared = root / "SharedAgentData"
+            machine_root = shared / "AgentBridgeStateSync" / "v1" / "machines" / "source-machine" / "codex"
+            machine_root.mkdir(parents=True)
+            sentinels = {
+                machine_root / "project-index.jsonl": b"project sentinel\n",
+                machine_root / "ui-state.json": b"ui sentinel\n",
+                machine_root / "manifest.json": b"manifest sentinel\n",
+            }
+            for path, body in sentinels.items():
+                path.write_bytes(body)
+            original_read_text = Path.read_text
+
+            def guarded_read_text(path: Path, *args: object, **kwargs: object) -> str:
+                if path == state:
+                    raise PermissionError("temporarily locked")
+                return original_read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", guarded_read_text):
+                with self.assertRaisesRegex(StateSyncError, "could not read native Codex state"):
+                    publish_codex_state(
+                        codex_home=home,
+                        shared_root=shared,
+                        machine_id="source-machine",
+                        settle_seconds=0,
+                    )
+            self.assertEqual({path: path.read_bytes() for path in sentinels}, sentinels)
 
     def test_artifact_relative_path_rejects_mid_path_drive_and_ads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

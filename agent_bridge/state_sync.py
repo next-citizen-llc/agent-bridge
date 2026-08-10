@@ -36,6 +36,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Callable, Iterable, Iterator
+from urllib.parse import urlsplit
 
 from .correlation import iso_now
 from .readiness import machine_id as stable_machine_id
@@ -292,13 +293,48 @@ def _normalize_git_remote(value: str) -> str:
     remote = str(value or "").strip()
     if not remote:
         return ""
-    remote = re.sub(r"^git@([^:]+):", r"https://\1/", remote)
-    remote = re.sub(r"^ssh://git@([^/]+)/", r"https://\1/", remote)
-    remote = remote.rstrip("/")
-    if remote.endswith(".git"):
-        remote = remote[:-4]
-    match = re.search(r"github\.com/([^/]+/[^/]+)$", remote, flags=re.IGNORECASE)
-    return match.group(1).lower() if match else remote.lower()
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in remote):
+        return ""
+    if (
+        remote.casefold().startswith("file:")
+        or remote.startswith(("/", "\\\\"))
+        or remote.startswith(("./", "../", "~/"))
+        or bool(re.match(r"^[A-Za-z]:", remote))
+    ):
+        return ""
+
+    scp = re.fullmatch(r"(?:[^@/:\s]+@)?([^@/:\s]+):([^\s]+)", remote)
+    if scp and "://" not in remote:
+        host, path = scp.groups()
+        path = re.split(r"[?#]", path, maxsplit=1)[0]
+    else:
+        try:
+            parsed = urlsplit(remote)
+            host = parsed.hostname
+            _ = parsed.port
+        except ValueError:
+            return ""
+        if parsed.scheme.casefold() not in {"http", "https", "ssh", "git", "git+ssh", "ssh+git"} or not host:
+            return ""
+        path = parsed.path
+
+    canonical_host = host.casefold()
+    if canonical_host.endswith("."):
+        canonical_host = canonical_host[:-1]
+    if (
+        not canonical_host
+        or canonical_host.startswith(".")
+        or canonical_host.endswith(".")
+        or ".." in canonical_host
+    ):
+        return ""
+
+    path = path.strip("/").removesuffix(".git").rstrip("/")
+    if not path:
+        return ""
+    if canonical_host in {"github.com", "www.github.com", "ssh.github.com"}:
+        return path.casefold()
+    return f"{canonical_host}/{path}".casefold()
 
 
 def _git_remote(path: str) -> str:
@@ -780,14 +816,12 @@ def _publish_codex_state_unlocked(
     home = _resolve_codex_home(codex_home)
     if not home.is_dir():
         raise StateSyncError(f"Codex home does not exist: {home}")
+    global_state = _read_native_json_object(home / ".codex-global-state.json")
     archive = _resolve_archive_root(shared_root, create=True)
     source_machine = _validate_machine_id(machine_id)
     machine_root = archive / "machines" / source_machine / "codex"
     machine_root.mkdir(parents=True, exist_ok=True)
     registry = _load_project_registry(project_registry)
-    global_state = _read_json(home / ".codex-global-state.json", {})
-    if not isinstance(global_state, dict):
-        global_state = {}
     projects = _project_records(global_state, registry)
     ui_state = _ui_state_fragment(global_state)
     threads = _read_threads(_state_db_path(home))

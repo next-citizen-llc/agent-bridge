@@ -127,3 +127,23 @@ are authored as Tristan Springmeyer, with **no** agent/assistant attribution —
 agent trailers, no "Generated with …" footers in commits/PRs/issues. Keep branch names, PR titles,
 tags, and other repo-visible surfaces neutral and descriptive; never expose agent/tool identity in
 them.
+
+## Thread-Aware Email Sending (standing rule for every agent this bridge dispatches)
+
+- Before composing or sending ANY email on Tristan's behalf, first scan his
+  mailboxes for an existing thread on the topic — all three: the nextcz.com
+  Outlook mailbox, tristan.springmeyer@gmail.com, and thistristan@gmail.com.
+  Recruiting and business threads are routinely split across them.
+- Default to replying within the existing thread, FROM the same address the
+  thread lives under, so threading and recipient expectations hold.
+- Err on the side of asking, always: when there is any ambiguity, present the
+  found thread(s) and ask whether the message should be a reply to an
+  existing thread or a new email — before any send.
+- This composes with (never replaces) Explicit Approval Before Sending
+  Messages: the thread choice and sending address are part of the payload
+  that gets approved.
+- Learned 2026-08-26 (Celonis references delivery): the live thread
+  ("Additional point of contact") existed in Gmail under
+  tristan.springmeyer@gmail.com while the agent's draft assumed the nextcz
+  Outlook mailbox; Tristan caught it — "it needs to be a reply to the thread
+  so not sure you would have done that correctly."

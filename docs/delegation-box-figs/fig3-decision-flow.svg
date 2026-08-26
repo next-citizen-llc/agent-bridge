@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" style="background:#ffffff" viewBox="0 0 900 260" role="img" aria-label="Decision flow: live-state decision goes to self; own-context-bias goes to fresh reviewer; recurring mechanical goes to code; specifiable with acceptance checks goes to brief and delegate; everything else stays with self">
+  <style>text{font-family:'IBM Plex Mono',monospace;font-size:11px}</style>
+  <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#3d444d"/></marker></defs>
+  <g fill="none" stroke="#3d444d" stroke-width="1.3">
+    <rect x="10" y="100" width="150" height="56" rx="4"/>
+    <rect x="215" y="18" width="176" height="46" rx="4" stroke="#B33A3A"/>
+    <rect x="215" y="80" width="176" height="46" rx="4" stroke="#3A5FA8"/>
+    <rect x="215" y="142" width="176" height="46" rx="4" stroke="#6B5E8E"/>
+    <rect x="215" y="204" width="176" height="46" rx="4" stroke="#2E6B45"/>
+    <rect x="470" y="18" width="180" height="46" rx="4" stroke="#B33A3A"/>
+    <rect x="470" y="80" width="180" height="46" rx="4" stroke="#3A5FA8"/>
+    <rect x="470" y="142" width="180" height="46" rx="4" stroke="#6B5E8E"/>
+    <rect x="470" y="204" width="180" height="46" rx="4" stroke="#2E6B45"/>
+    <rect x="700" y="204" width="190" height="46" rx="4" stroke="#2E6B45" stroke-dasharray="4 3"/>
+    <line x1="160" y1="118" x2="215" y2="41" marker-end="url(#arr)"/>
+    <line x1="160" y1="124" x2="215" y2="103" marker-end="url(#arr)"/>
+    <line x1="160" y1="132" x2="215" y2="165" marker-end="url(#arr)"/>
+    <line x1="160" y1="138" x2="215" y2="227" marker-end="url(#arr)"/>
+    <line x1="391" y1="41" x2="470" y2="41" marker-end="url(#arr)"/>
+    <line x1="391" y1="103" x2="470" y2="103" marker-end="url(#arr)"/>
+    <line x1="391" y1="165" x2="470" y2="165" marker-end="url(#arr)"/>
+    <line x1="391" y1="227" x2="470" y2="227" marker-end="url(#arr)"/>
+    <line x1="650" y1="227" x2="700" y2="227" marker-end="url(#arr)"/>
+  </g>
+  <text x="85" y="124" text-anchor="middle" fill="#3d444d">every task,</text>
+  <text x="85" y="140" text-anchor="middle" fill="#3d444d">in order:</text>
+  <text x="303" y="38" text-anchor="middle" fill="#3d444d">decision on live state?</text>
+  <text x="303" y="54" text-anchor="middle" fill="#3d444d">(position, incident, now)</text>
+  <text x="303" y="100" text-anchor="middle" fill="#3d444d">would my own context</text>
+  <text x="303" y="116" text-anchor="middle" fill="#3d444d">bias the result?</text>
+  <text x="303" y="162" text-anchor="middle" fill="#3d444d">recurring + rule-based,</text>
+  <text x="303" y="178" text-anchor="middle" fill="#3d444d">no judgment per run?</text>
+  <text x="303" y="224" text-anchor="middle" fill="#3d444d">can I write acceptance</text>
+  <text x="303" y="240" text-anchor="middle" fill="#3d444d">checks + a full brief?</text>
+  <text x="560" y="45" text-anchor="middle" fill="#B33A3A" font-weight="600">DO IT YOURSELF</text>
+  <text x="560" y="107" text-anchor="middle" fill="#3A5FA8" font-weight="600">FRESH REVIEWER</text>
+  <text x="560" y="169" text-anchor="middle" fill="#6B5E8E" font-weight="600">DAEMON / CRON</text>
+  <text x="560" y="231" text-anchor="middle" fill="#2E6B45" font-weight="600">BRIEF &amp; DELEGATE</text>
+  <text x="795" y="224" text-anchor="middle" fill="#3d444d">tier: cheap if checkable,</text>
+  <text x="795" y="240" text-anchor="middle" fill="#3d444d">frontier if judged</text>
+  <text x="795" y="196" text-anchor="middle" fill="#768390" font-size="9">no on all four → keep it</text>
+</svg>

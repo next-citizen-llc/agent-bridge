@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" style="background:#ffffff" viewBox="0 0 460 420" role="img" aria-label="The Delegation Box for agents: four quadrants over urgency and context-coupling — Do it yourself, Brief and delegate, Fresh eyes, Code or kill">
+  <style>text{font-family:'IBM Plex Mono',monospace}</style>
+  <line x1="60" y1="20" x2="60" y2="360" stroke="#3d444d" stroke-width="1.5"/>
+  <line x1="60" y1="360" x2="440" y2="360" stroke="#3d444d" stroke-width="1.5"/>
+  <polygon points="60,20 55,30 65,30" fill="#3d444d"/>
+  <polygon points="440,360 430,355 430,365" fill="#3d444d"/>
+  <text x="30" y="200" font-size="11" fill="#3d444d" transform="rotate(-90 30 200)" text-anchor="middle">CONTEXT-COUPLING →</text>
+  <text x="250" y="392" font-size="11" fill="#3d444d" text-anchor="middle">URGENCY →</text>
+  <rect x="252" y="28" width="180" height="160" fill="#F6E4E4" stroke="#B33A3A" stroke-width="1.5"/>
+  <text x="342" y="86" font-size="15" font-weight="600" fill="#B33A3A" text-anchor="middle">DO IT YOURSELF</text>
+  <text x="342" y="106" font-size="9.5" fill="#3d444d" text-anchor="middle">live calls · incident triage</text>
+  <text x="342" y="121" font-size="9.5" fill="#3d444d" text-anchor="middle">cold-start &gt; task cost</text>
+  <rect x="66" y="28" width="180" height="160" fill="#E2EFe7" stroke="#2E6B45" stroke-width="1.5"/>
+  <text x="156" y="86" font-size="15" font-weight="600" fill="#2E6B45" text-anchor="middle">BRIEF &amp; DELEGATE</text>
+  <text x="156" y="106" font-size="9.5" fill="#3d444d" text-anchor="middle">the brief IS the plan</text>
+  <text x="156" y="121" font-size="9.5" fill="#3d444d" text-anchor="middle">tier by verifiability</text>
+  <rect x="252" y="194" width="180" height="160" fill="#E3EAF7" stroke="#3A5FA8" stroke-width="1.5"/>
+  <text x="342" y="252" font-size="15" font-weight="600" fill="#3A5FA8" text-anchor="middle">FRESH EYES</text>
+  <text x="342" y="272" font-size="9.5" fill="#3d444d" text-anchor="middle">your context is a LIABILITY</text>
+  <text x="342" y="287" font-size="9.5" fill="#3d444d" text-anchor="middle">adversarial review · audits</text>
+  <rect x="66" y="194" width="180" height="160" fill="#EBE7F3" stroke="#6B5E8E" stroke-width="1.5"/>
+  <text x="156" y="252" font-size="15" font-weight="600" fill="#6B5E8E" text-anchor="middle">CODE OR KILL</text>
+  <text x="156" y="272" font-size="9.5" fill="#3d444d" text-anchor="middle">recurring · mechanical</text>
+  <text x="156" y="287" font-size="9.5" fill="#3d444d" text-anchor="middle">cron beats any model</text>
+  <text x="342" y="168" font-size="9" fill="#B33A3A" text-anchor="middle" font-style="italic">context you HAVE</text>
+  <text x="342" y="340" font-size="9" fill="#3A5FA8" text-anchor="middle" font-style="italic">context you must SHED</text>
+</svg>

@@ -1,0 +1,4 @@
+# Direct quality-tool pins. Regenerate the universal Python 3.11 lock with:
+# uv pip compile --universal --python-version 3.11 --generate-hashes requirements-quality.in -o requirements-quality.txt
+mypy==1.20.2
+ruff==0.16.1

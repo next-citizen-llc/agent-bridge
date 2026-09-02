@@ -259,11 +259,29 @@ def _registry_maps(registry: dict[str, Any]) -> tuple[dict[str, str], dict[str, 
     return path_to_slug, paths_by_slug, names
 
 
+_ROOT_LIKE_PATH = re.compile(r"^(?://\?/)?(?:/users/[^/]+|/home/[^/]+|[a-z]:(?:/users/[^/]+)?)$")
+
+
+def _is_root_like_path(key: str) -> bool:
+    """True for home directories and drive roots.
+
+    A registry entry rooted at a home directory matches every unregistered
+    subdirectory by longest prefix and silently injects the wrong checkpoint.
+    Such entries may still match exactly, never as a prefix.
+    """
+    normalized = str(key or "").rstrip("/")
+    return normalized in ("", "/") or bool(_ROOT_LIKE_PATH.match(normalized.casefold()))
+
+
 def _registry_slug_for_path(path: str, path_to_slug: dict[str, str]) -> str | None:
     key = _path_key(path)
     if key in path_to_slug:
         return path_to_slug[key]
-    matches = [(known, slug) for known, slug in path_to_slug.items() if _path_is_within(key, known)]
+    matches = [
+        (known, slug)
+        for known, slug in path_to_slug.items()
+        if _path_is_within(key, known) and not _is_root_like_path(known)
+    ]
     if not matches:
         return None
     matches.sort(key=lambda item: len(item[0]), reverse=True)

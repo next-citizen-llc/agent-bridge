@@ -567,3 +567,31 @@ class StateSyncTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- registry resolver: home directories must never win a prefix match ------
+import unittest as _unittest
+
+from agent_bridge import state_sync as _state_sync
+
+
+class RegistryRootLikeGuardTest(_unittest.TestCase):
+    def test_home_directory_entry_never_wins_prefix_match(self) -> None:
+        registry = {
+            "projects": [
+                {"slug": "home", "workspace_macos": "/Users/tts", "workspace_windows": "C:\\Users\\thist"},
+                {"slug": "bridge", "workspace_macos": "/Users/tts/Code/agent-bridge"},
+            ]
+        }
+        path_to_slug, _, _ = _state_sync._registry_maps(registry)
+        self.assertEqual(_state_sync._registry_slug_for_path("/Users/tts/Code/agent-bridge/sub", path_to_slug), "bridge")
+        self.assertIsNone(_state_sync._registry_slug_for_path("/Users/tts/Desktop", path_to_slug))
+        self.assertIsNone(_state_sync._registry_slug_for_path("C:\\Users\\thist\\Documents", path_to_slug))
+        # An exact match of the home entry itself is still legitimate.
+        self.assertEqual(_state_sync._registry_slug_for_path("/Users/tts", path_to_slug), "home")
+
+    def test_root_like_detection(self) -> None:
+        for value in ("", "/", "/Users/tts", "/home/alice", "c:", "C:/Users/thist", "//?/C:/Users/thist"):
+            self.assertTrue(_state_sync._is_root_like_path(value), value)
+        for value in ("/Users/tts/Code", "/opt/data", "C:/Users/thist/OneDrive", "/Users/tts/Library/CloudStorage"):
+            self.assertFalse(_state_sync._is_root_like_path(value), value)

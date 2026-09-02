@@ -190,13 +190,18 @@ def context_status(manifest_path: Path, *, client: str = "") -> dict[str, Any]:
                 "error": error,
             }
         )
+    # A manifest with `retired_on` set and no adapters is a deliberate end state
+    # (for example an expired announcement), not a misconfiguration.
+    retired_on = str(manifest.get("retired_on") or "")
+    retired = bool(retired_on) and not manifest["adapters"]
     return {
         "schema_version": SCHEMA_VERSION,
         "manifest": str(manifest_path),
         "canonical_hash": canonical_hash(manifest, manifest_path=manifest_path),
         "precedence": manifest["precedence"],
         "overlaps": overlaps,
-        "ok": bool(rows) and all(row["status"] == "current" for row in rows) and not overlaps,
+        "retired_on": retired_on,
+        "ok": retired or (bool(rows) and all(row["status"] == "current" for row in rows) and not overlaps),
         "adapters": rows,
     }
 

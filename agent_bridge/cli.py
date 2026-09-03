@@ -43,6 +43,7 @@ from .coord import (
     run_doctor,
     set_trace_context,
 )
+from .codex_hooks import CodexHooksError, audit as codex_hook_audit, format_audit as format_codex_audit, prune_stale_state, repair_trust
 from .context_adapters import ContextAdapterError, context_status, install_context_adapters
 from .correlation import add_meta_args, child_turn_meta, ensure_run_meta, extract_meta, format_meta, iso_now, safe_fragment, utc_stamp
 from .findings import (
@@ -2078,7 +2079,7 @@ Use the installed `agent` command as the front door for local and cross-harness 
 
 - Check shared machine and harness presence: `agent code harness status`
 - Register the current harness manually: `agent code harness register --client <codex|claude|other>`
-- Check local SessionStart hooks and wrappers: `agent code hooks status --client all`
+- Check local SessionStart hooks and wrappers: `agent code hooks status --client all`. Config presence cannot prove a Codex hook runs; `agent code hooks audit --client codex` reads the live registry, and `agent code hooks repair-trust --client codex --apply` restores trust for owned hooks Codex is skipping.
 - Inspect or force the canonical bridge refresh: `agent code update <status|check|apply>`
 - Check tracked repos for drift and uncommitted work: `agent code repos status`
 - List the configured managed repos and their modes: `agent code repos list`
@@ -2828,6 +2829,32 @@ def surface_hook_installed(surface: dict[str, Any]) -> bool:
     return False
 
 
+CODEX_HOOK_TIMEOUT_SECONDS = int(os.environ.get("AGENT_BRIDGE_CODEX_HOOK_TIMEOUT", "20"))
+
+
+def _codex_trust_report(timeout: int = CODEX_HOOK_TIMEOUT_SECONDS) -> dict[str, Any]:
+    """Live Codex hook trust, degraded rather than fatal when unavailable.
+
+    An unreachable registry is reported as unavailable, never as blocked: a
+    machine without Codex installed must not fail a status check.
+    """
+    project = os.environ.get("PWD") or str(Path.cwd())
+    try:
+        report = codex_hook_audit(cwds=[project], timeout=timeout)
+    except CodexHooksError as exc:
+        return {"available": False, "detail": str(exc), "blocked_owned": [], "blocked_foreign": [], "stale_state_keys": []}
+    report["available"] = True
+    return report
+
+
+def _codex_trust_lines(trust: dict[str, Any] | None) -> list[str]:
+    if not trust:
+        return []
+    if not trust.get("available"):
+        return [f"codex hook registry: unavailable ({trust.get('detail', 'unknown reason')})"]
+    return format_codex_audit(trust)
+
+
 def hooks_cmd(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="agent code hooks",
@@ -2844,6 +2871,21 @@ def hooks_cmd(argv: list[str]) -> int:
     status = sub.add_parser("status")
     status.add_argument("--client", default="all", help="client name, both, or all")
     status.add_argument("--json", action="store_true")
+    status.add_argument(
+        "--no-trust-audit",
+        action="store_true",
+        help="Skip the live Codex hook-trust audit. Config presence alone cannot prove a hook runs.",
+    )
+    audit = sub.add_parser("audit", help="Report live Codex hook trust; a config-file check cannot see this.")
+    audit.add_argument("--client", default="codex", help="Only codex exposes a live hook registry today.")
+    audit.add_argument("--json", action="store_true")
+    audit.add_argument("--timeout", type=int, default=CODEX_HOOK_TIMEOUT_SECONDS)
+    repair = sub.add_parser("repair-trust", help="Persist normal trust for owned hooks Codex is skipping.")
+    repair.add_argument("--client", default="codex")
+    repair.add_argument("--apply", action="store_true", help="Write the trust records. Without it, report only.")
+    repair.add_argument("--prune-stale", action="store_true", help="Also remove trust records addressing no live handler.")
+    repair.add_argument("--json", action="store_true")
+    repair.add_argument("--timeout", type=int, default=CODEX_HOOK_TIMEOUT_SECONDS)
     args = parser.parse_args(argv)
 
     manifest = load_surface_manifest()
@@ -2929,6 +2971,58 @@ def hooks_cmd(argv: list[str]) -> int:
                 path = f" ({row['config_path']})" if row.get("config_path") else ""
                 print(f"{row['client']}: {row['status']}{path}")
         return 1 if any(row["status"] == "modified-preserved" for row in rows) else 0
+    if args.cmd in {"audit", "repair-trust"}:
+        if args.client != "codex":
+            raise BridgeError(f"{args.cmd} supports only --client codex; no other harness exposes a hook registry")
+        trust = _codex_trust_report(timeout=args.timeout)
+        if not trust.get("available"):
+            if args.json:
+                _json_print(trust)
+            else:
+                print(_codex_trust_lines(trust)[0], file=sys.stderr)
+            return 1
+        if args.cmd == "audit":
+            if args.json:
+                _json_print(trust)
+            else:
+                for line in _codex_trust_lines(trust):
+                    print(line)
+            return 1 if trust["blocked_owned"] else 0
+        outcome: dict[str, Any] = {"applied": bool(args.apply)}
+        if args.apply:
+            outcome["repair"] = repair_trust(trust["handlers"], timeout=args.timeout)
+            outcome["prune"] = prune_stale_state(trust["handlers"], apply_changes=bool(args.prune_stale))
+            verified = _codex_trust_report(timeout=args.timeout)
+            outcome["verified"] = verified
+        else:
+            outcome["would_trust"] = trust["blocked_owned"]
+            outcome["would_skip"] = trust["blocked_foreign"]
+            outcome["would_prune"] = trust["stale_state_keys"]
+        if args.json:
+            _json_print(outcome)
+        else:
+            if args.apply:
+                for item in outcome["repair"]["trusted"]:
+                    print(f"trusted {item['event']} {item['key']}: {item['command'][:96]}")
+                for item in outcome["repair"]["skipped"]:
+                    print(f"left alone (not an owned source root) {item['event']} {item['key']}", file=sys.stderr)
+                for key in outcome["prune"]["removed"]:
+                    print(f"pruned stale trust record {key}")
+                if outcome["prune"].get("backup"):
+                    print(f"backup: {outcome['prune']['backup']}")
+                for line in _codex_trust_lines(outcome["verified"]):
+                    print(line)
+            else:
+                for item in trust["blocked_owned"]:
+                    print(f"would trust {item['event']} {item['key']}: {item['command'][:96]}")
+                for item in trust["blocked_foreign"]:
+                    print(f"would leave alone {item['event']} {item['key']}: {item['command'][:96]}")
+                for key in trust["stale_state_keys"]:
+                    print(f"would prune stale trust record {key}")
+                print("report only; pass --apply to write the trust records")
+        if args.apply:
+            return 1 if outcome["verified"].get("blocked_owned") else 0
+        return 1 if trust["blocked_owned"] else 0
     try:
         registry_rows = load_harness_registry(stale_minutes=1440).get("harnesses", [])
     except (BridgeError, OSError, AssertionError):
@@ -2968,13 +3062,20 @@ def hooks_cmd(argv: list[str]) -> int:
             }
         )
     result = {"schema_version": manifest.get("schema_version", "1.0"), "hooks": rows}
+    trust: dict[str, Any] | None = None
+    if "codex" in clients and not args.no_trust_audit:
+        trust = _codex_trust_report()
+        result["codex_trust"] = trust
     if args.json:
         _json_print(result)
     else:
         for row in rows:
             path = f" ({row['config_path']})" if row.get("config_path") else ""
             print(f"{row['client']}/{row['surface']}: {row['status']} [{row['startup_mechanism']}]{path}")
-    return 0 if all(row["status"] != "missing" for row in rows) else 1
+        for line in _codex_trust_lines(trust):
+            print(line)
+    missing = any(row["status"] == "missing" for row in rows)
+    return 1 if missing or bool((trust or {}).get("blocked_owned")) else 0
 
 
 def harness_cmd(argv: list[str]) -> int:
@@ -4052,7 +4153,7 @@ def main(argv: list[str]) -> int:
     print("       agent code optimize <route|cacheability|compress> [options]", file=sys.stderr)
     print("       agent code update <status|check|apply> [options]", file=sys.stderr)
     print("       agent code hook session-start [options]", file=sys.stderr)
-    print("       agent code hooks <install|uninstall|status> [options]", file=sys.stderr)
+    print("       agent code hooks <install|uninstall|status|audit|repair-trust> [options]", file=sys.stderr)
     print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
     print("       agent code sessions <inventory|recover> [options]", file=sys.stderr)
     print("       agent code workstreams report [options]", file=sys.stderr)
